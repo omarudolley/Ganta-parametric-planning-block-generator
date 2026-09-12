@@ -308,12 +308,12 @@ st.caption("Road-based planning blocks constrained by ward boundaries. Target ar
 
 with st.sidebar:
     st.header("Block parameters")
-    target_ha=st.number_input("Target block area (ha)", min_value=1.0, max_value=100.0, value=1.0, step=1.0)
+    target_ha=st.number_input("Target block area (ha)", min_value=1.0, max_value=100.0, value=3.0, step=1.0)
     tolerance_pct=st.slider("Allowed variation (%)", 5, 50, 20, 5)
-    min_ha=st.number_input("Minimum block area (ha)", min_value=0.25, max_value=50.0, value=0.5, step=0.25)
+    min_ha=st.number_input("Minimum block area (ha)", min_value=0.25, max_value=50.0, value=0.25, step=0.25)
     st.subheader("Road hierarchy")
     major=st.multiselect("Start with roads", ["primary","trunk","tertiary","unclassified","residential","service","track","path"],
-                         default=["primary","trunk","tertiary","unclassified"])
+                         default=["primary","trunk","tertiary","unclassified","residential","service","track","path"])
     st.subheader("Map styling")
     ward_color=st.color_picker("Ward outline colour", "#222222")
     ward_weight=st.slider("Ward line weight", 1.0, 8.0, 4.0, 0.5)
