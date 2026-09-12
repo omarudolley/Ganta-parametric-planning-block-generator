@@ -247,7 +247,7 @@ with st.sidebar:
     road_source=st.selectbox('Dataset used to generate blocks',['Selected GIS road classes','All GIS roads','No road structure (target only)'])
     classes=st.multiselect('Road hierarchy used',['primary','trunk','tertiary','unclassified','residential','service','track','path','footway'],default=['primary','trunk','tertiary','unclassified','residential'])
     st.subheader('Basemap')
-    basemap=st.selectbox('Visual basemap',['OpenStreetMap','Esri World Imagery','Esri World Street Map','Google Roadmap (API key/session required)','Google Satellite (API key/session required)'])
+    basemap=st.selectbox('Visual basemap',['Esri World Imagery','Esri World Street Map','OpenStreetMap','Google Roadmap (API key/session required)','Google Satellite (API key/session required)'])
     google_key=st.text_input('Google API key (optional)',type='password',help='Used only for Google Map Tiles. Google visual tiles are never used as road data.')
     google_road_session=st.text_input('Google Roadmap session token (optional)',type='password')
     google_sat_session=st.text_input('Google Satellite session token (optional)',type='password')
