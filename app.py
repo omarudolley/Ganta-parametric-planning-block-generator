@@ -54,18 +54,45 @@ def road_cells(geom, roads):
     return cells or [geom]
 
 def boundary_road_metrics(cell, roads, ward_geom):
-    # Only roads forming the candidate boundary count. Ward boundary is explicitly excluded.
+    # Count only road segments that actually form the candidate boundary.
+    # Ward-edge overlap is removed so a whole-ward polygon can never qualify.
     b=cell.boundary
     try:
+        ward_b=ward_geom.boundary
+        interior_b=b.difference(ward_b)
+        if interior_b.is_empty: return 0.0,0.0,0
         hits=[]
-        for g in roads.geometry:
-            if g is None or g.is_empty: continue
-            inter=b.intersection(g)
+        idxs=roads.sindex.query(interior_b,predicate='intersects') if len(roads) else []
+        for idx in idxs:
+            g=roads.geometry.iloc[int(idx)]
+            inter=interior_b.intersection(g)
             if not inter.is_empty and inter.length>5: hits.append(float(inter.length))
-        total=sum(hits); ratio=total/max(b.length,1.0)
+        total=sum(hits); ratio=total/max(interior_b.length,1.0)
         meaningful=sum(1 for h in hits if h>=15)
         return total,ratio,meaningful
     except Exception:return 0.0,0.0,0
+
+def enforce_partition(cells, ward):
+    # Final topological safety pass: planning blocks must form a true partition.
+    # Remove any overlap by subtracting already accepted area, then repair the
+    # small numerical gaps back to the nearest block.
+    accepted=[]; occupied=None
+    for c in sorted(cells, key=lambda x: x.area, reverse=True):
+        c=clean(c.intersection(ward))
+        if c.is_empty or c.area<=1: continue
+        if occupied is not None:
+            c=clean(c.difference(occupied))
+        if c.is_empty or c.area<=1: continue
+        accepted.append(c)
+        occupied=c if occupied is None else clean(occupied.union(c))
+    gap=clean(ward.difference(occupied)) if occupied is not None else clean(ward)
+    if not gap.is_empty and gap.area>0.01 and accepted:
+        gs=list(gap.geoms) if gap.geom_type=='MultiPolygon' else [gap]
+        for g in gs:
+            if g.area<=0.01: continue
+            i=min(range(len(accepted)),key=lambda k:accepted[k].distance(g))
+            accepted[i]=clean(accepted[i].union(g))
+    return [clean(c) for c in accepted if not c.is_empty and c.area>1]
 
 def split_best(poly,target):
     poly=clean(poly)
@@ -80,7 +107,7 @@ def split_best(poly,target):
     for use_x in ([True,False] if abs(w-h)/max(w,h,1)>0.12 else [True,False]):
         lo,hi=(minx,maxx) if use_x else (miny,maxy); span=hi-lo
         if span<=0:continue
-        for frac in np.linspace(0.15,0.85,15):
+        for frac in np.linspace(0.20,0.80,7):
             v=lo+span*float(frac); pad=max(w,h)*3+10
             ln=LineString([(v,miny-pad),(v,maxy+pad)]) if use_x else LineString([(minx-pad,v),(maxx+pad,v)])
             try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
@@ -106,16 +133,24 @@ def target_subdivide(poly,target,min_area):
     return out
 
 def merge_tiny(cells,min_area):
+    # Remove tiny residuals without creating artificial mega-blocks.
+    # Prefer the adjacent block with the smallest area; shared-boundary length
+    # is used as a tie-breaker. There is deliberately no target-derived ceiling.
     cells=[clean(c) for c in cells if c is not None and not c.is_empty and c.area>1]
-    while True:
+    guard=0
+    while guard<10000:
+        guard+=1
         idx=[i for i,c in enumerate(cells) if c.area<min_area]
-        if not idx or len(cells)<=1:break
-        i=min(idx,key=lambda k:cells[k].area); best=None; bestscore=-1
+        if not idx or len(cells)<=1: break
+        i=min(idx,key=lambda k:cells[k].area)
+        candidates=[]
         for j,c in enumerate(cells):
-            if j==i:continue
+            if j==i: continue
             shared=cells[i].boundary.intersection(c.boundary).length
-            if shared>bestscore:bestscore=shared;best=j
-        if best is None or bestscore<=0.01:break
+            if shared>0.01:
+                candidates.append((c.area, -shared, j))
+        if not candidates: break
+        _,_,best=min(candidates)
         merged=clean(cells[i].union(cells[best]))
         cells=[c for k,c in enumerate(cells) if k not in (i,best)]+[merged]
     return cells
@@ -145,24 +180,30 @@ def generate(target_m2,min_m2,classes,road_source):
         natural=road_cells(wg,r) if len(r) else [wg]
         pieces=[]
         for cell in natural:
-            road_len,ratio,sides=boundary_road_metrics(cell,r,wg)
-            # A cell is genuinely road-defined only if roads form substantial boundary structure.
+            _,ratio,sides=boundary_road_metrics(cell,r,wg)
             natural_unit=(sides>=2 and ratio>=0.20) or (sides>=3 and ratio>=0.12)
-            if natural_unit:
+            # Roads can produce larger natural blocks, but a road polygon that is
+            # many times the requested planning scale is treated as a mega-block
+            # and subdivided. This prevents ward-scale polygons from surviving.
+            mega_block=cell.area > target_m2*10.0
+            if natural_unit and not mega_block:
                 pieces.append(cell)
             else:
                 pieces.extend(target_subdivide(cell,target_m2,min_m2))
         pieces=merge_tiny(pieces,min_m2)
         pieces=repair_partition(pieces,wg)
-        # Second pass: only weak, very large pieces are target-subdivided; road-defined large units stay intact.
+        # Final safety pass: no weak block may remain materially above target,
+        # and no nested/overlapping geometry is allowed.
         refined=[]
         for p in pieces:
-            rl,rr,ss=boundary_road_metrics(p,r,wg)
+            _,rr,ss=boundary_road_metrics(p,r,wg)
             natural_unit=(ss>=2 and rr>=0.20) or (ss>=3 and rr>=0.12)
-            if (not natural_unit) and p.area>target_m2*1.02:
+            mega_block=p.area>target_m2*10.0
+            if p.area>target_m2*1.02 and (not natural_unit or mega_block):
                 refined.extend(target_subdivide(p,target_m2,min_m2))
-            else:refined.append(p)
-        pieces=repair_partition(merge_tiny(refined,min_m2),wg)
+            else: refined.append(p)
+        pieces=enforce_partition(merge_tiny(refined,min_m2),wg)
+        pieces=enforce_partition(merge_tiny(pieces,min_m2),wg)
         ward_name=str(w.get('ward',w.get('Zone_Code',w.get('Id',''))))
         for p in pieces:all_blocks.append({'ward':ward_name,'geometry':p})
     blocks=gpd.GeoDataFrame(all_blocks,crs=wards.crs)
@@ -178,15 +219,15 @@ def generate(target_m2,min_m2,classes,road_source):
     return blocks[['block_id','ward','area_m2','area_ha','target_m2','deviation_pct','status','building_count','geometry']],wards,roads,buildings
 
 st.title('Ganta Parametric Planning Block Generator')
-st.caption('Ward boundaries are hard limits. Roads define natural planning blocks where they form a coherent layout; the target guides subdivision only where the road structure is weak.')
+st.caption('Ward boundaries are hard limits. Roads define natural planning blocks where they form a coherent layout; the target guides subdivision where the road structure is weak. Blocks are forced into a non-overlapping partition with no nested blocks.')
 with st.sidebar:
     st.header('Block parameters')
-    target_ha=st.number_input('Target block area (ha)',min_value=1.0,max_value=100.0,value=3.0,step=0.25)
+    target_ha=st.number_input('Target block area (ha)',min_value=1.0,max_value=100.0,value=1.0,step=0.25)
     tolerance_pct=st.slider('Target preference / reporting tolerance (%)',0,50,20,5,key='tolerance_pct')
     min_ha=st.number_input('Minimum block area (ha)',min_value=0.25,max_value=50.0,value=0.25,step=0.25)
     st.subheader('Road structure source')
     road_source=st.selectbox('Dataset used to generate blocks',['Selected GIS road classes','All GIS roads','No road structure (target only)'])
-    classes=st.multiselect('Road hierarchy used',['primary','trunk','tertiary','unclassified','residential','service','track','path','footway'],default=['primary','trunk','tertiary','unclassified','residential','service','track','path','footway'])
+    classes=st.multiselect('Road hierarchy used',['primary','trunk','tertiary','unclassified','residential','service','track','path','footway'],default=['primary','trunk','tertiary','unclassified','residential'])
     st.subheader('Basemap')
     basemap=st.selectbox('Visual basemap',['Esri World Street Map','OpenStreetMap','Esri World Imagery','Google Roadmap (API key/session required)','Google Satellite (API key/session required)'])
     google_key=st.text_input('Google API key (optional)',type='password',help='Used only for Google Map Tiles. Google visual tiles are never used as road data.')
@@ -234,4 +275,4 @@ with right:
     st.download_button('Download planning blocks (GeoJSON)',blocks.to_json(),'Ganta_PlanningBlocks.geojson','application/geo+json')
     st.download_button('Download summary (CSV)',blocks.drop(columns='geometry').to_csv(index=False),'Ganta_PlanningBlocks_Summary.csv','text/csv')
 st.markdown('### Planning rule used')
-st.write('Ward boundary = hard boundary. Selected GIS roads are the primary structure source. A road-defined cell is retained at its natural size when roads form meaningful portions of its boundary. Where the layout is weak, clean target-oriented cuts are used. The target is never a maximum, and reporting tolerance does not constrain generation. Buildings are used only for validation/reporting, not as block boundaries.')
+st.write('Ward boundary = hard boundary. Selected GIS roads are the primary structure source. A road-defined cell is retained at its natural size only when roads form meaningful portions of its interior boundary; ward-edge roads do not qualify. Where the layout is weak, clean target-oriented cuts are used. The target is never a maximum, and reporting tolerance does not constrain generation. Buildings are used only for validation/reporting, not as block boundaries. A final topology pass guarantees a single, non-overlapping block partition per ward.')
