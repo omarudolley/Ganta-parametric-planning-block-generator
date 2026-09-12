@@ -206,11 +206,21 @@ def learn_block_pattern(reference_cells, fallback_target):
     core=areas[(areas>=q05)&(areas<=q95)]
     if len(core)==0: core=areas
     elong=np.array([_shape_metrics(c) for c in reference_cells if c.area>1],dtype=float)
+    q25=float(np.quantile(core,0.25)); q75=float(np.quantile(core,0.75))
+    # Polygonization can produce very large road-enclosed polygons that are
+    # technically bounded by roads but are not credible planning blocks. Use
+    # the upper quartile of the robust road-block population as the maximum
+    # scale that context-generated blocks may reach. This keeps the ceiling
+    # evidence-based while preventing anomalous 100s/1000s-ha polygons from
+    # becoming the reference ceiling.
+    plausible_cap=float(q75)
     return {'median_area':float(np.median(core)),
-            'q25':float(np.quantile(core,0.25)),
-            'q75':float(np.quantile(core,0.75)),
+            'q25':q25,
+            'q75':q75,
             'median_elongation':float(np.median(elong)) if len(elong) else 1.0,
-            'count':int(len(reference_cells)),'max_area':float(max(areas))}
+            'count':int(len(reference_cells)),
+            'max_area':float(plausible_cap),
+            'raw_max_area':float(max(areas))}
 
 def learned_target(poly, refs_gdf, pattern, user_target):
     """Get a context-sensitive preferred scale for a road-poor polygon.
@@ -327,6 +337,9 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
         pieces=enforce_learned_cap(pieces,max_reference_area)
         pieces=enforce_partition(pieces,wg)
         pieces=enforce_learned_cap(pieces,max_reference_area)
+        # Re-partition after every cap split so the final output can never
+        # contain overlaps, nested polygons, or sliver gaps.
+        pieces=enforce_partition(pieces,wg)
         all_blocks.extend({'ward':ward_name,'geometry':p} for p in pieces)
 
     blocks=gpd.GeoDataFrame(all_blocks,crs=wards.crs)
@@ -343,12 +356,12 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     # QA metadata retained in the dataframe attrs for the app panel.
     blocks.attrs['learned_reference_count']=pattern['count']
     blocks.attrs['learned_median_area_ha']=pattern['median_area']/10000
-    blocks.attrs['largest_road_defined_area_ha']=(max_reference_area/10000 if max_reference_area else None)
+    blocks.attrs['largest_road_reference_cap_ha']=(max_reference_area/10000 if max_reference_area else None)
     blocks.attrs['context_generated_count']=generated_by_context
     return blocks[['block_id','ward','area_m2','area_ha','target_m2','deviation_pct','status','building_count','geometry']],wards,roads,buildings
 
 st.title('Ganta Parametric Planning Block Generator')
-st.caption('Ward boundaries are hard limits. Existing roads define natural planning blocks where they form a coherent layout. Road-poor areas learn their preferred block scale from nearby established road-defined blocks. Generated/context blocks never exceed the largest coherent road-defined reference block; the target remains a soft preference. Blocks form a non-overlapping partition with no nested blocks.')
+st.caption('Ward boundaries are hard limits. Existing roads define natural planning blocks where they form a coherent layout. Road-poor areas learn their preferred block scale from nearby established road-defined blocks. Generated/context blocks never exceed the robust upper scale learned from coherent road-defined blocks; anomalous giant polygonized areas are not treated as planning-block references; the target remains a soft preference. Blocks form a non-overlapping partition with no nested blocks.')
 with st.sidebar:
     st.header('Block parameters')
     target_ha=st.number_input('Target block area (ha)',min_value=1.0,max_value=100.0,value=1.0,step=0.25)
@@ -368,7 +381,7 @@ with st.sidebar:
     block_fill=st.checkbox('Fill planning blocks',value=False); block_fill_opacity=st.slider('Block fill opacity',0.0,0.8,0.15,0.05)
     road_weight=st.slider('Road line weight',0.5,5.0,1.5,0.5)
     generate_btn=st.button('Generate blocks',type='primary',use_container_width=True)
-    st.info('Target area is a preference, not a maximum. Generated/context blocks are capped only by the largest coherent block observed in the road network. The tolerance affects reporting only. Minimum area suppresses tiny residual blocks.')
+    st.info('Target area is a preference, not a maximum. Generated/context blocks are capped by the robust upper scale of the observed road-defined block pattern, excluding anomalous giant polygonized areas. The tolerance affects reporting only. Minimum area suppresses tiny residual blocks.')
 
 gen_sig=(float(target_ha),float(min_ha),road_source,tuple(classes))
 map_sig=(basemap,google_key,google_road_session,google_sat_session,ward_color,ward_weight,block_color,block_weight,block_fill,block_fill_opacity,road_weight)
