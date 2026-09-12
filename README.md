@@ -1,30 +1,31 @@
 # Ganta Parametric Planning Block Generator
 
-A Streamlit web app for generating road-informed planning blocks inside the 9 Ganta wards.
-
-## What it does
-
-- Ward boundaries are hard limits: no block crosses a ward.
-- Selected roads form the primary subdivision framework.
-- Where the road network leaves very large areas, the app introduces clean subdivision lines so block sizes remain relatively similar to the target.
-- Tiny fragments are merged into adjacent blocks where possible.
-- Blocks are never drawn as nested/filled polygons on the map: the map uses outline-only block symbology.
-- Ward outlines and planning-block outlines use different colours/styles.
-- Hovering a block displays its Block ID and Ward, plus area, status and building count.
-- Hovering a ward displays the Ward label.
-- Buildings are used only as a validation indicator, not as a block boundary.
-- Export planning blocks as GeoJSON and the summary table as CSV.
-
-## Run
+Run with:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # macOS/Linux
-# .venv\\Scripts\\activate     # Windows
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Planning interpretation
+## What is fixed
+- Ward boundaries are hard limits; blocks cannot cross wards.
+- Blocks are a true partition: no overlapping or nested blocks.
+- Tiny residuals are merged into adjacent blocks using the minimum-area setting.
+- No hidden target-derived maximum is used.
+- Roads determine natural block size where they form meaningful block boundaries.
+- Weak/no-road areas are subdivided toward the target area.
+- Buildings are not used as block boundaries.
+- Block and ward outlines have independent colour/line-weight controls.
+- Block fill is optional and off by default.
+- Hovering a block reports Block, Ward, Area, Status, and Buildings.
+- Basemap and road-structure source are independent controls.
 
-The target area (for example 20 ha / 200,000 m²) is an optimization target rather than an exact legal parcel size. The generator prioritizes ward containment, a coherent road framework, relatively even block sizes, and avoidance of tiny fragments. Artificial subdivision lines are introduced only where the road network cannot reasonably produce the target-sized blocks on its own.
+## Basemap
+OpenStreetMap and Esri basemaps work directly. Google Roadmap/Satellite options are included as API-key/session-token options. Google visual tiles are never used to generate planning blocks.
+
+## Road structure source
+- Selected GIS road classes
+- All GIS roads
+- No road structure (target-only)
+
+The included `Ganta_BaseData.gpkg` remains the actual road/building source.

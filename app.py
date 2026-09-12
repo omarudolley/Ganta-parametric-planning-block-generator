@@ -12,6 +12,7 @@ DATA='Ganta_BaseData.gpkg'; WARDS='Ganta_Wards.shp'
 ROAD_CLASSES=['primary','trunk','tertiary','unclassified','residential','service','track','path','footway']
 
 @st.cache_data
+@st.cache_data(show_spinner=False)
 def load_data():
     roads=gpd.read_file(DATA, layer='ganta_roads')
     buildings=gpd.read_file(DATA, layer='ganta_buildings')
@@ -95,6 +96,9 @@ def enforce_partition(cells, ward):
     return [clean(c) for c in accepted if not c.is_empty and c.area>1]
 
 def split_best(poly,target):
+    # Fast deterministic split: cut across the longer bounding-box axis near
+    # the midpoint. A small set of alternatives handles irregular polygons
+    # without the combinatorial cost of evaluating many cuts recursively.
     poly=clean(poly)
     if poly.is_empty or poly.area<=target*1.02:return [poly]
     if poly.geom_type=='MultiPolygon':
@@ -102,23 +106,22 @@ def split_best(poly,target):
         for p in poly.geoms: out.extend(split_best(p,target))
         return out
     minx,miny,maxx,maxy=poly.bounds; w=maxx-minx; h=maxy-miny
-    # Try both orientations and several positions; score partition by closeness of resulting pieces to target.
-    cand=[]
-    for use_x in ([True,False] if abs(w-h)/max(w,h,1)>0.12 else [True,False]):
-        lo,hi=(minx,maxx) if use_x else (miny,maxy); span=hi-lo
-        if span<=0:continue
-        for frac in np.linspace(0.20,0.80,7):
-            v=lo+span*float(frac); pad=max(w,h)*3+10
-            ln=LineString([(v,miny-pad),(v,maxy+pad)]) if use_x else LineString([(minx-pad,v),(maxx+pad,v)])
-            try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
-            except Exception:continue
-            if len(pieces)<2:continue
-            # Recursive partition is done outside; first cut should leave no very tiny piece.
-            areas=np.array([p.area for p in pieces]); small=(areas<0.25*target).sum()
-            score=abs(np.median(areas)-target)/max(target,1)+0.8*small+0.15*abs(areas.max()-target)/max(target,1)
-            cand.append((score,pieces))
-    if not cand:return [poly]
-    return min(cand,key=lambda x:x[0])[1]
+    use_x=w>=h
+    lo,hi=(minx,maxx) if use_x else (miny,maxy); span=hi-lo
+    if span<=0:return [poly]
+    candidates=[]
+    for frac in (0.45,0.50,0.55):
+        v=lo+span*frac; pad=max(w,h)*2+10
+        ln=LineString([(v,miny-pad),(v,maxy+pad)]) if use_x else LineString([(minx-pad,v),(maxx+pad,v)])
+        try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
+        except Exception: continue
+        if len(pieces)<2: continue
+        areas=np.array([p.area for p in pieces])
+        # Prefer balanced pieces and penalize fragments below the minimum.
+        small=(areas<0.25*target).sum()
+        score=abs(np.median(areas)-target)/max(target,1)+1.0*small+0.10*abs(areas.max()-target)/max(target,1)
+        candidates.append((score,pieces))
+    return min(candidates,key=lambda x:x[0])[1] if candidates else [poly]
 
 def target_subdivide(poly,target,min_area):
     out=[]; stack=[poly]; guard=0
@@ -133,27 +136,41 @@ def target_subdivide(poly,target,min_area):
     return out
 
 def merge_tiny(cells,min_area):
-    # Remove tiny residuals without creating artificial mega-blocks.
-    # Prefer the adjacent block with the smallest area; shared-boundary length
-    # is used as a tie-breaker. There is deliberately no target-derived ceiling.
+    # Fast residual cleanup. Do not repeatedly merge tiny cells into one another:
+    # that was both slow and a source of artificial mega-blocks. Attach each
+    # residual directly to an existing core block using the spatial index.
     cells=[clean(c) for c in cells if c is not None and not c.is_empty and c.area>1]
-    guard=0
-    while guard<10000:
-        guard+=1
-        idx=[i for i,c in enumerate(cells) if c.area<min_area]
-        if not idx or len(cells)<=1: break
-        i=min(idx,key=lambda k:cells[k].area)
+    if len(cells)<=1: return cells
+    core=[c for c in cells if c.area>=min_area]
+    tiny=[c for c in cells if c.area<min_area]
+    if not tiny: return cells
+    if not core: return [clean(unary_union(cells))]
+    core_gdf=gpd.GeoDataFrame({'geometry':core},crs='EPSG:32629')
+    sidx=core_gdf.sindex
+    assignments={i:[] for i in range(len(core))}
+    for t in tiny:
+        best=None
+        try:
+            hits=sidx.query(t,predicate='intersects')
+        except Exception:
+            hits=[]
         candidates=[]
-        for j,c in enumerate(cells):
-            if j==i: continue
-            shared=cells[i].boundary.intersection(c.boundary).length
-            if shared>0.01:
-                candidates.append((c.area, -shared, j))
-        if not candidates: break
-        _,_,best=min(candidates)
-        merged=clean(cells[i].union(cells[best]))
-        cells=[c for k,c in enumerate(cells) if k not in (i,best)]+[merged]
-    return cells
+        for j in hits:
+            j=int(j); shared=t.boundary.intersection(core[j].boundary).length
+            if shared>0.01: candidates.append((core[j].area,-shared,j))
+        if candidates:
+            best=min(candidates)[2]
+        else:
+            try:
+                nearest=list(sidx.nearest(t))
+                if nearest: best=int(nearest[0])
+            except Exception: pass
+        if best is not None: assignments[best].append(t)
+    out=[]
+    for i,c in enumerate(core):
+        if assignments[i]: c=clean(c.union(unary_union(assignments[i])))
+        out.append(c)
+    return out
 
 def repair_partition(cells,ward):
     cells=[clean(c.intersection(ward)) for c in cells if c is not None and not c.is_empty]
@@ -168,7 +185,8 @@ def repair_partition(cells,ward):
             i=min(range(len(cells)),key=lambda k:cells[k].distance(g)); cells[i]=clean(cells[i].union(g))
     return [clean(c.intersection(ward)) for c in cells if not c.is_empty and c.area>1]
 
-def generate(target_m2,min_m2,classes,road_source):
+@st.cache_data(show_spinner=False)
+def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     roads,buildings,wards=load_data()
     if road_source=='No road structure (target only)': selected=roads.iloc[0:0].copy()
     elif road_source=='All GIS roads': selected=roads.copy()
@@ -213,7 +231,7 @@ def generate(target_m2,min_m2,classes,road_source):
     blocks['building_count']=[int(counts.get(i,0)) for i in blocks.index]
     blocks['area_m2']=blocks.area; blocks['area_ha']=blocks.area/10000
     blocks['target_m2']=target_m2; blocks['deviation_pct']=(blocks.area/target_m2-1)*100
-    tol=st.session_state.get('tolerance_pct',20)/100
+    tol=float(tolerance_pct)/100
     blocks['status']=np.select([blocks.area<target_m2*(1-tol),blocks.area>target_m2*(1+tol)],['below_preferred','above_preferred'],default='within_preferred')
     blocks['block_id']=[f'{w}-B{i:03d}' for i,w in enumerate(blocks.ward,1)]
     return blocks[['block_id','ward','area_m2','area_ha','target_m2','deviation_pct','status','building_count','geometry']],wards,roads,buildings
@@ -229,7 +247,7 @@ with st.sidebar:
     road_source=st.selectbox('Dataset used to generate blocks',['Selected GIS road classes','All GIS roads','No road structure (target only)'])
     classes=st.multiselect('Road hierarchy used',['primary','trunk','tertiary','unclassified','residential','service','track','path','footway'],default=['primary','trunk','tertiary','unclassified','residential'])
     st.subheader('Basemap')
-    basemap=st.selectbox('Visual basemap',['Esri World Street Map','OpenStreetMap','Esri World Imagery','Google Roadmap (API key/session required)','Google Satellite (API key/session required)'])
+    basemap=st.selectbox('Visual basemap',['OpenStreetMap','Esri World Imagery','Esri World Street Map','Google Roadmap (API key/session required)','Google Satellite (API key/session required)'])
     google_key=st.text_input('Google API key (optional)',type='password',help='Used only for Google Map Tiles. Google visual tiles are never used as road data.')
     google_road_session=st.text_input('Google Roadmap session token (optional)',type='password')
     google_sat_session=st.text_input('Google Satellite session token (optional)',type='password')
@@ -241,11 +259,12 @@ with st.sidebar:
     generate_btn=st.button('Generate blocks',type='primary',use_container_width=True)
     st.info('Target area is a preference, not a maximum. No hidden target-derived ceiling is used. The tolerance affects reporting only. Minimum area is used to suppress tiny residual blocks.')
 
-sig=(float(target_ha),int(tolerance_pct),float(min_ha),road_source,tuple(classes),basemap,google_key,google_road_session,google_sat_session)
-if 'blocks' not in st.session_state or st.session_state.get('sig')!=sig or generate_btn:
+gen_sig=(float(target_ha),float(min_ha),road_source,tuple(classes))
+map_sig=(basemap,google_key,google_road_session,google_sat_session,ward_color,ward_weight,block_color,block_weight,block_fill,block_fill_opacity,road_weight)
+if 'blocks' not in st.session_state or st.session_state.get('gen_sig')!=gen_sig or generate_btn:
     with st.spinner('Generating planning blocks...'):
-        blocks,wards,roads,buildings=generate(target_ha*10000,min_ha*10000,classes,road_source)
-        st.session_state.update(blocks=blocks,wards=wards,roads=roads,buildings=buildings,sig=sig)
+        blocks,wards,roads,buildings=generate(target_ha*10000,min_ha*10000,classes,road_source,tolerance_pct)
+        st.session_state.update(blocks=blocks,wards=wards,roads=roads,buildings=buildings,gen_sig=gen_sig)
 blocks=st.session_state.blocks; wards=st.session_state.wards; roads=st.session_state.roads
 map_blocks=blocks.to_crs(4326); map_wards=wards.to_crs(4326); map_roads=roads.to_crs(4326)
 bounds=map_wards.total_bounds; center=[(bounds[1]+bounds[3])/2,(bounds[0]+bounds[2])/2]
@@ -254,10 +273,10 @@ c1,c2,c3,c4=st.columns(4); c1.metric('Planning blocks',len(blocks)); c2.metric('
 left,right=st.columns([2,1])
 with left:
     m=folium.Map(location=center,zoom_start=13,tiles=None,control_scale=True)
-    folium.TileLayer('OpenStreetMap',name='OpenStreetMap',control=True,show=(basemap=='OpenStreetMap' or (basemap.startswith('Google') and not google_ok))).add_to(m)
+    google_ok=False
+    folium.TileLayer('OpenStreetMap',name='OpenStreetMap',control=True,show=(basemap=='OpenStreetMap' or basemap.startswith('Google'))).add_to(m)
     folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',attr='Esri',name='Esri World Imagery',control=True,show=basemap=='Esri World Imagery',overlay=False).add_to(m)
     folium.TileLayer(tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',attr='Esri',name='Esri World Street Map',control=True,show=basemap=='Esri World Street Map',overlay=False).add_to(m)
-    google_ok=False
     if basemap.startswith('Google Roadmap') and google_key and google_road_session:
         url='https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}?session='+google_road_session+'&key='+google_key
         folium.TileLayer(tiles=url,attr='Google Maps Platform',name='Google Roadmap',control=True,show=True,overlay=False).add_to(m); google_ok=True
