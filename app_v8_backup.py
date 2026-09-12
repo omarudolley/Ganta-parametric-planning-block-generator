@@ -78,10 +78,14 @@ def adjacency(cells):
 
 
 def split_polygon_balanced(poly, target):
-    """Fast robust subdivision using a small set of balanced axis-aligned cuts."""
+    """Split a polygon robustly using the longest bounding-box dimension.
+    MultiPolygons are handled part-by-part. The cut is an artificial planning
+    line used only to prevent oversized blocks.
+    """
     poly = clean_geom(poly)
     if poly.is_empty or poly.area <= target * 1.05:
         return [poly]
+
     if poly.geom_type == "MultiPolygon":
         pieces = []
         for part in poly.geoms:
@@ -91,15 +95,8 @@ def split_polygon_balanced(poly, target):
     minx, miny, maxx, maxy = poly.bounds
     width, height = maxx - minx, maxy - miny
     use_x = width >= height
-    lo, hi = (minx, maxx) if use_x else (miny, maxy)
-    span = hi - lo
-    if span <= 0:
-        return [poly]
 
-    # Prefer cuts near the middle, then slightly offset cuts for irregular shapes.
-    candidates = []
-    for frac in (0.50, 0.45, 0.55, 0.40, 0.60, 0.33, 0.67):
-        v = lo + span * frac
+    def cut_at(v):
         pad = max(width, height) * 2 + 10
         if use_x:
             line = LineString([(v, miny-pad), (v, maxy+pad)])
@@ -107,19 +104,56 @@ def split_polygon_balanced(poly, target):
             line = LineString([(minx-pad, v), (maxx+pad, v)])
         try:
             from shapely.ops import split
-            pp = [clean_geom(g) for g in split(poly, line).geoms if g.area > 1]
-            if len(pp) >= 2:
-                # Score by largest piece, then by difference between the two largest.
-                pp = sorted(pp, key=lambda g: g.area, reverse=True)
-                largest = pp[0].area
-                second = pp[1].area
-                candidates.append((largest, abs(largest-second), pp))
+            result = split(poly, line)
+            return [clean_geom(g) for g in result.geoms if g.area > 1]
         except Exception:
+            return []
+
+    # Find a cut close to a half-area division. This guarantees recursive
+    # subdivision rather than leaving a huge road cell untouched.
+    lo, hi = (minx, maxx) if use_x else (miny, maxy)
+    best = []
+    best_err = float('inf')
+    for _ in range(36):
+        mid = (lo + hi) / 2
+        pieces = cut_at(mid)
+        if len(pieces) < 2:
+            # If the line does not cross this geometry, move through the range.
+            if use_x:
+                lo = mid
+            else:
+                lo = mid
             continue
-    if not candidates:
+        # For a simple cut, compare the largest resulting side with half.
+        pieces_sorted = sorted(pieces, key=lambda g: g.area, reverse=True)
+        a = pieces_sorted[0].area
+        b = sum(g.area for g in pieces_sorted[1:])
+        err = abs(a - b)
+        if err < best_err:
+            best_err, best = err, pieces
+        if a > b:
+            if use_x: hi = mid
+            else: hi = mid
+        else:
+            if use_x: lo = mid
+            else: lo = mid
+
+    if len(best) < 2:
+        # Try several quantile positions as a fallback for irregular geometry.
+        for frac in (0.25, 0.33, 0.40, 0.50, 0.60, 0.67, 0.75):
+            v = lo + (hi-lo)*frac
+            pieces = cut_at(v)
+            if len(pieces) >= 2:
+                best = pieces
+                break
+
+    if len(best) < 2:
         return [poly]
-    _, _, best = min(candidates, key=lambda x: (x[0], x[1]))
+
+    # If a cut yields more than two pieces, assign fragments to the nearest
+    # principal piece so the output remains a clean set of non-overlapping blocks.
     if len(best) > 2:
+        best = sorted(best, key=lambda g: g.area, reverse=True)
         a, b = best[0], best[1]
         for frag in best[2:]:
             if frag.centroid.distance(a) <= frag.centroid.distance(b):
@@ -128,6 +162,7 @@ def split_polygon_balanced(poly, target):
                 b = clean_geom(b.union(frag))
         best = [a, b]
     return best
+
 
 def subdivide_oversized(cells, target, tolerance):
     """Recursively subdivide cells until no block is extremely oversized."""
@@ -273,10 +308,8 @@ def generate(target_m2, tolerance, min_area, classes):
                 if cells and max(c.area for c in cells) <= target_m2 * (1 + tolerance):
                     break
 
-        # The road polygonization plus recursive splitting/merging already forms a
-        # partition of the ward. Keeping that partition directly avoids the expensive
-        # candidate-face reassignment step that caused the previous version to produce
-        # visual nesting/overlap artefacts at small target areas.
+        # Hard guarantee: no block-in-block and no overlapping blocks.
+        cells = partition_nonoverlap(cells, wg)
         for c in cells:
             c = clean_geom(c.intersection(wg))
             if not c.is_empty and c.area > 1:
@@ -308,12 +341,12 @@ st.caption("Road-based planning blocks constrained by ward boundaries. Target ar
 
 with st.sidebar:
     st.header("Block parameters")
-    target_ha=st.number_input("Target block area (ha)", min_value=1.0, max_value=100.0, value=1.0, step=1.0)
+    target_ha=st.number_input("Target block area (ha)", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
     tolerance_pct=st.slider("Allowed variation (%)", 5, 50, 20, 5)
-    min_ha=st.number_input("Minimum block area (ha)", min_value=0.25, max_value=50.0, value=0.5, step=0.25)
+    min_ha=st.number_input("Minimum block area (ha)", min_value=0.25, max_value=50.0, value=5.0, step=0.25)
     st.subheader("Road hierarchy")
     major=st.multiselect("Start with roads", ["primary","trunk","tertiary","unclassified","residential","service","track","path"],
-                         default=["primary","trunk","tertiary","unclassified"])
+                         default=["primary","trunk","tertiary","unclassified","residential"])
     st.subheader("Map styling")
     ward_color=st.color_picker("Ward outline colour", "#222222")
     ward_weight=st.slider("Ward line weight", 1.0, 8.0, 4.0, 0.5)
@@ -322,18 +355,15 @@ with st.sidebar:
     block_fill=st.checkbox("Fill planning blocks", value=False)
     block_fill_opacity=st.slider("Block fill opacity", 0.0, 0.8, 0.15, 0.05)
     generate_btn=st.button("Generate blocks", type="primary", use_container_width=True)
-    st.info("The blocks regenerate automatically when you change the parameters. Ward boundaries remain hard limits; target area and allowed variation control the preferred block-size range.")
+    st.info("Tip: start around 20 ha target and ±20% tolerance. Add track/path only if large areas remain unbroken.")
 
-param_signature = (float(target_ha), int(tolerance_pct), float(min_ha), tuple(major))
-params_changed = st.session_state.get("block_param_signature") != param_signature
-if "blocks" not in st.session_state or generate_btn or params_changed:
+if "blocks" not in st.session_state or generate_btn:
     with st.spinner("Generating road-based planning blocks..."):
         blocks, wards, roads, buildings = generate(target_ha*10000, tolerance_pct/100, min_ha*10000, major)
         st.session_state.blocks=blocks
         st.session_state.wards=wards
         st.session_state.roads=roads
         st.session_state.buildings=buildings
-        st.session_state.block_param_signature = param_signature
 
 blocks=st.session_state.blocks
 wards=st.session_state.wards
