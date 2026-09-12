@@ -185,120 +185,46 @@ def repair_partition(cells,ward):
             i=min(range(len(cells)),key=lambda k:cells[k].distance(g)); cells[i]=clean(cells[i].union(g))
     return [clean(c.intersection(ward)) for c in cells if not c.is_empty and c.area>1]
 
-def _shape_metrics(poly):
-    minx,miny,maxx,maxy=poly.bounds
-    w=max(maxx-minx,1.0); h=max(maxy-miny,1.0)
-    return max(w,h)/max(min(w,h),1.0)
-
-def learn_block_pattern(reference_cells, fallback_target):
-    """Learn a robust planning-block scale from road-defined reference cells."""
-    if not reference_cells:
-        return {'median_area':fallback_target,'q25':fallback_target,'q75':fallback_target,
-                'median_elongation':1.0,'count':0}
-    areas=np.array([c.area for c in reference_cells if c.area>1],dtype=float)
-    if len(areas)==0:
-        return {'median_area':fallback_target,'q25':fallback_target,'q75':fallback_target,
-                'median_elongation':1.0,'count':0}
-    # Robustly ignore only the extreme tails when learning scale; this is not a
-    # ceiling on real blocks, it simply prevents a few exceptional polygons from
-    # dominating the reference pattern.
-    q05,q95=np.quantile(areas,[0.05,0.95]) if len(areas)>=4 else (areas.min(),areas.max())
-    core=areas[(areas>=q05)&(areas<=q95)]
-    if len(core)==0: core=areas
-    elong=np.array([_shape_metrics(c) for c in reference_cells if c.area>1],dtype=float)
-    return {'median_area':float(np.median(core)),
-            'q25':float(np.quantile(core,0.25)),
-            'q75':float(np.quantile(core,0.75)),
-            'median_elongation':float(np.median(elong)) if len(elong) else 1.0,
-            'count':int(len(reference_cells))}
-
-def learned_target(poly, refs_gdf, pattern, user_target):
-    """Get a context-sensitive preferred scale for a road-poor polygon.
-    Nearby established road-defined blocks are the primary reference; the user's
-    target remains a soft preference and fallback rather than a hard maximum.
-    """
-    if refs_gdf is None or len(refs_gdf)==0 or pattern['count']==0:
-        return user_target
-    try:
-        near=list(refs_gdf.sindex.nearest(poly, return_all=False))
-        if len(near):
-            ref_area=float(refs_gdf.geometry.iloc[int(near[0])].area)
-            # Blend local evidence with the global learned median and the user's
-            # stated preference. Local road pattern gets the strongest weight.
-            desired=0.55*ref_area + 0.25*pattern['median_area'] + 0.20*user_target
-        else:
-            desired=0.70*pattern['median_area']+0.30*user_target
-    except Exception:
-        desired=0.70*pattern['median_area']+0.30*user_target
-    # Keep the learned recommendation within the observed central range, but do
-    # not use that range as a maximum: an intact road-defined block can remain larger.
-    lo=max(pattern['q25']*0.75, user_target*0.50, 1.0)
-    hi=max(pattern['q75']*1.25, user_target*1.50, lo)
-    return float(np.clip(desired,lo,hi))
-
 @st.cache_data(show_spinner=False)
 def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     roads,buildings,wards=load_data()
     if road_source=='No road structure (target only)': selected=roads.iloc[0:0].copy()
     elif road_source=='All GIS roads': selected=roads.copy()
-    else: selected=road_mask(roads,classes)
-
-    # First pass: derive road-defined natural units for every ward. These become
-    # the reference population from which road-poor areas learn their local scale.
-    ward_naturals=[]; reference=[]
+    else:selected=road_mask(roads,classes)
+    all_blocks=[]
     for _,w in wards.iterrows():
         wg=clean(w.geometry)
         r=selected[selected.intersects(wg)]
         natural=road_cells(wg,r) if len(r) else [wg]
-        ward_naturals.append((str(w.get('ward',w.get('Zone_Code',w.get('Id','')))),wg,r,natural))
-        for cell in natural:
-            _,ratio,sides=boundary_road_metrics(cell,r,wg)
-            natural_unit=(sides>=2 and ratio>=0.20) or (sides>=3 and ratio>=0.12)
-            if natural_unit and cell.area>=min_m2:
-                reference.append(cell)
-
-    pattern=learn_block_pattern(reference,target_m2)
-    ref_gdf=gpd.GeoDataFrame({'geometry':reference},crs=wards.crs) if reference else None
-
-    all_blocks=[]
-    generated_by_context=0
-    for ward_name,wg,r,natural in ward_naturals:
         pieces=[]
         for cell in natural:
             _,ratio,sides=boundary_road_metrics(cell,r,wg)
             natural_unit=(sides>=2 and ratio>=0.20) or (sides>=3 and ratio>=0.12)
-            if natural_unit:
-                # Existing road-defined blocks are retained even when larger than
-                # the preferred scale. This is the key distinction from a hidden
-                # maximum-area rule.
+            # Roads can produce larger natural blocks, but a road polygon that is
+            # many times the requested planning scale is treated as a mega-block
+            # and subdivided. This prevents ward-scale polygons from surviving.
+            mega_block=cell.area > target_m2*10.0
+            if natural_unit and not mega_block:
                 pieces.append(cell)
             else:
-                desired=learned_target(cell,ref_gdf,pattern,target_m2)
-                if cell.area>desired*1.02:
-                    pieces.extend(target_subdivide(cell,desired,min_m2))
-                    generated_by_context += 1
-                else:
-                    pieces.append(cell)
-
+                pieces.extend(target_subdivide(cell,target_m2,min_m2))
         pieces=merge_tiny(pieces,min_m2)
         pieces=repair_partition(pieces,wg)
-        # Only weak/context-generated polygons are subdivided here. A coherent
-        # road-defined unit is never broken merely because it exceeds the target.
+        # Final safety pass: no weak block may remain materially above target,
+        # and no nested/overlapping geometry is allowed.
         refined=[]
         for p in pieces:
             _,rr,ss=boundary_road_metrics(p,r,wg)
             natural_unit=(ss>=2 and rr>=0.20) or (ss>=3 and rr>=0.12)
-            if p.area>target_m2*1.02 and not natural_unit:
-                desired=learned_target(p,ref_gdf,pattern,target_m2)
-                if p.area>desired*1.02:
-                    refined.extend(target_subdivide(p,desired,min_m2)); generated_by_context += 1
-                else: refined.append(p)
+            mega_block=p.area>target_m2*10.0
+            if p.area>target_m2*1.02 and (not natural_unit or mega_block):
+                refined.extend(target_subdivide(p,target_m2,min_m2))
             else: refined.append(p)
         pieces=enforce_partition(merge_tiny(refined,min_m2),wg)
-        all_blocks.extend({'ward':ward_name,'geometry':p} for p in pieces)
-
+        pieces=enforce_partition(merge_tiny(pieces,min_m2),wg)
+        ward_name=str(w.get('ward',w.get('Zone_Code',w.get('Id',''))))
+        for p in pieces:all_blocks.append({'ward':ward_name,'geometry':p})
     blocks=gpd.GeoDataFrame(all_blocks,crs=wards.crs)
-    # One building spatial join only, after final block geometry is known.
     bpts=buildings.copy(); bpts['geometry']=bpts.geometry.centroid
     joined=gpd.sjoin(bpts,blocks[['geometry']],predicate='within',how='left')
     counts=joined.groupby('index_right').size()
@@ -308,14 +234,10 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     tol=float(tolerance_pct)/100
     blocks['status']=np.select([blocks.area<target_m2*(1-tol),blocks.area>target_m2*(1+tol)],['below_preferred','above_preferred'],default='within_preferred')
     blocks['block_id']=[f'{w}-B{i:03d}' for i,w in enumerate(blocks.ward,1)]
-    # QA metadata retained in the dataframe attrs for the app panel.
-    blocks.attrs['learned_reference_count']=pattern['count']
-    blocks.attrs['learned_median_area_ha']=pattern['median_area']/10000
-    blocks.attrs['context_generated_count']=generated_by_context
     return blocks[['block_id','ward','area_m2','area_ha','target_m2','deviation_pct','status','building_count','geometry']],wards,roads,buildings
 
 st.title('Ganta Parametric Planning Block Generator')
-st.caption('Ward boundaries are hard limits. Existing roads define natural planning blocks where they form a coherent layout. Road-poor areas learn their preferred block scale from nearby established road-defined blocks; the target is a soft preference, not a hidden maximum. Blocks form a non-overlapping partition with no nested blocks.')
+st.caption('Ward boundaries are hard limits. Roads define natural planning blocks where they form a coherent layout; the target guides subdivision where the road structure is weak. Blocks are forced into a non-overlapping partition with no nested blocks.')
 with st.sidebar:
     st.header('Block parameters')
     target_ha=st.number_input('Target block area (ha)',min_value=1.0,max_value=100.0,value=1.0,step=0.25)
