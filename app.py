@@ -95,14 +95,22 @@ def enforce_partition(cells, ward):
             accepted[i]=clean(accepted[i].union(g))
     return [clean(c) for c in accepted if not c.is_empty and c.area>1]
 
-def _line_building_penalty(line, buildings):
-    """Measure how much a proposed block cut passes through buildings.
-    The score is deliberately strong: in road-poor areas we prefer a slightly
-    less area-balanced cut if it avoids existing building footprints."""
+def _line_building_penalty(line, buildings, poly=None):
+    """Measure only the portion of a proposed cut that lies inside *poly*.
+    Building footprints are treated as protected geometry: crossing one is a
+    very strong penalty, while a cut in a genuine gap is preferred."""
     if buildings is None or len(buildings) == 0:
         return 0.0, 0
+    test_line = line
+    if poly is not None:
+        try:
+            test_line = line.intersection(poly)
+        except Exception:
+            return 0.0, 0
+    if test_line.is_empty:
+        return 0.0, 0
     try:
-        hits = buildings.sindex.query(line, predicate='intersects')
+        hits = buildings.sindex.query(test_line, predicate='intersects')
     except Exception:
         hits = []
     if len(hits) == 0:
@@ -111,18 +119,60 @@ def _line_building_penalty(line, buildings):
     count = 0
     for idx in hits:
         try:
-            inter = line.intersection(buildings.geometry.iloc[int(idx)])
-            if not inter.is_empty:
+            inter = test_line.intersection(buildings.geometry.iloc[int(idx)])
+            if not inter.is_empty and inter.length > 0.01:
                 total += float(inter.length)
                 count += 1
         except Exception:
             pass
     return total, count
 
+
+def _building_gap_positions(poly, buildings, axis, max_candidates=8):
+    """Return cut positions located in actual gaps between local building
+    bounding boxes. This is especially useful where roads do not define a
+    usable layout. Bounding boxes are only used to find safe gaps; buildings
+    themselves never become block boundaries."""
+    if buildings is None or len(buildings) == 0:
+        return []
+    minx, miny, maxx, maxy = poly.bounds
+    try:
+        # Fast spatial-index lookup: only inspect buildings near this polygon.
+        local_idx = buildings.sindex.query(poly, predicate='intersects')
+    except Exception:
+        return []
+    intervals = []
+    lo, hi = (minx, maxx) if axis == 'x' else (miny, maxy)
+    for idx in local_idx:
+        try:
+            b = buildings.geometry.iloc[int(idx)]
+            bx0, by0, bx1, by1 = b.bounds
+            a0, a1 = (bx0, bx1) if axis == 'x' else (by0, by1)
+            a0=max(a0,lo); a1=min(a1,hi)
+            if a1 > a0:
+                intervals.append((a0,a1))
+        except Exception:
+            continue
+    if not intervals:
+        return []
+    intervals.sort()
+    gaps=[]
+    cur=lo
+    for a0,a1 in intervals:
+        if a0-cur > max((hi-lo)*0.01, 2.0):
+            gaps.append((cur,a0,a0-cur))
+        cur=max(cur,a1)
+    if hi-cur > max((hi-lo)*0.01, 2.0):
+        gaps.append((cur,hi,hi-cur))
+    # Largest gaps are the most robust places to pass a block cut.
+    gaps.sort(key=lambda x:x[2], reverse=True)
+    return [(a+b)/2.0 for a,b,_ in gaps[:max_candidates]]
+
+
 def split_best(poly, target, buildings=None):
-    """Fast deterministic split that actively avoids cutting through buildings.
-    Candidate cuts are tested against the building spatial index. A no-building
-    cut wins whenever its area balance is reasonably acceptable."""
+    """Split a weak/context polygon while strongly preferring cuts through
+    genuine gaps between existing buildings. In road-poor areas, building
+    footprints act as protected constraints rather than block boundaries."""
     poly=clean(poly)
     if poly.is_empty or poly.area<=target*1.02:return [poly]
     if poly.geom_type=='MultiPolygon':
@@ -130,18 +180,24 @@ def split_best(poly, target, buildings=None):
         for p in poly.geoms: out.extend(split_best(p,target,buildings))
         return out
     minx,miny,maxx,maxy=poly.bounds; w=maxx-minx; h=maxy-miny
-    # Test both axes where possible; this gives the algorithm a chance to move
-    # around building clusters instead of always slicing on one axis.
-    axes=[]
-    if w>=h: axes=['x','y']
-    else: axes=['y','x']
+    axes=['x','y'] if w>=h else ['y','x']
     candidates=[]
     for axis in axes:
         lo,hi=(minx,maxx) if axis=='x' else (miny,maxy)
         span=hi-lo
         if span<=0: continue
-        for frac in (0.35,0.45,0.50,0.55,0.65):
-            v=lo+span*frac; pad=max(w,h)*2+10
+        # Normal area-balanced candidates.
+        positions=[lo+span*f for f in (0.30,0.40,0.50,0.60,0.70)]
+        # Add positions in real building-free gaps. These candidates are given
+        # priority over a mathematically perfect cut through a building.
+        positions += _building_gap_positions(poly,buildings,axis,max_candidates=10)
+        # De-duplicate close positions.
+        uniq=[]
+        for v in sorted(positions):
+            if lo+span*0.03 < v < hi-span*0.03 and all(abs(v-u)>span*0.01 for u in uniq):
+                uniq.append(v)
+        for v in uniq:
+            pad=max(w,h)*2+10
             ln=LineString([(v,miny-pad),(v,maxy+pad)]) if axis=='x' else LineString([(minx-pad,v),(maxx+pad,v)])
             try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
             except Exception: continue
@@ -150,15 +206,16 @@ def split_best(poly, target, buildings=None):
             small=(areas<0.25*target).sum()
             balance=abs(np.median(areas)-target)/max(target,1)
             oversize=max(areas.max()/max(target,1)-1,0)
-            cut_len,cut_count=_line_building_penalty(ln,buildings)
-            # A cut crossing even one building is heavily penalized. Zero-crossing
-            # candidates therefore dominate unless they create pathological pieces.
-            building_penalty=25.0*cut_count + 80.0*cut_len/max(np.sqrt(poly.area),1.0)
+            cut_len,cut_count=_line_building_penalty(ln,buildings,poly)
+            # Zero-crossing cuts win decisively. A crossing cut is allowed only
+            # when no usable building-free alternative exists.
+            building_penalty=1000.0*cut_count + 200.0*cut_len/max(np.sqrt(poly.area),1.0)
             score=balance + 1.5*small + 0.10*oversize + building_penalty
             candidates.append((score,cut_count,cut_len,pieces))
     if not candidates:return [poly]
-    # Prefer cuts that do not cross buildings; among those use geometry score.
     zero=[c for c in candidates if c[1]==0 and c[2] <= 0.01]
+    # Prefer safe cuts, but still allow a crossing cut if the geometry cannot
+    # produce two reasonable pieces without one.
     pool=zero if zero else candidates
     return min(pool,key=lambda x:x[0])[3]
 
