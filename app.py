@@ -382,6 +382,11 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
         all_blocks.extend({'ward':ward_name,'geometry':p} for p in pieces)
 
     blocks=gpd.GeoDataFrame(all_blocks,crs=wards.crs)
+    # Stable block IDs must exist BEFORE building/block spatial joins.
+    # Ward_Code is a machine-stable code (W01..W09), while ward remains human-readable.
+    ward_num=blocks['ward'].astype(str).str.extract(r'(\d+)',expand=False).astype(int)
+    blocks['Ward_Code']=ward_num.map(lambda n:f'W{n:02d}')
+    blocks['block_id']=[f'{wc}-B{i:03d}' for i,wc in enumerate(blocks['Ward_Code'],1)]
     # One building spatial join only, after final block geometry is known.
     bpts=buildings.copy(); bpts['geometry']=bpts.geometry.centroid
     joined=gpd.sjoin(bpts,blocks[['geometry']],predicate='within',how='left')
@@ -397,9 +402,9 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     # block boundary; boundary crossings are separately flagged below.
     reps=buildings_out.geometry.representative_point()
     rep_gdf=gpd.GeoDataFrame({'geometry':reps},crs=buildings_out.crs)
-    bj=gpd.sjoin(rep_gdf,blocks[['block_id','ward','geometry']],predicate='within',how='left')
+    bj=gpd.sjoin(rep_gdf,blocks[['block_id','Ward_Code','ward','geometry']],predicate='within',how='left')
     buildings_out['Block_Code']=bj['block_id'].values
-    buildings_out['Ward_Code']=bj['ward'].values
+    buildings_out['Ward_Code']=bj['Ward_Code'].values
     # A building is flagged if its footprint intersects more than one block or
     # if its boundary is actually crossed by a block edge. We never clip it.
     b_sidx=blocks.sindex
@@ -420,15 +425,16 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     buildings_out['Boundary_Flag']=[bool(a or b) for a,b in zip(boundary_flags,multi_flags)]
     buildings_out['Building_Source']='OSM existing'
     buildings_out['AI_Confidence']=np.nan
+    # Use the final block code directly. Do not cast an auxiliary order field
+    # to int: pandas/geopandas joins can legitimately produce NaN/object values.
     buildings_out['Building_Code']=[
-        f"{w}-B{int(str(b).split('-B')[-1]):03d}-BLD{i:04d}" if pd.notna(w) and pd.notna(b) else f"UNASSIGNED-BLD{i:04d}"
-        for i,(w,b) in enumerate(zip(buildings_out['Ward_Code'],buildings_out['Block_Code']),1)
+        f"{b}-BLD{i:04d}" if pd.notna(b) else f"UNASSIGNED-BLD{i:04d}"
+        for i,b in enumerate(buildings_out['Block_Code'],1)
     ]
     blocks['area_m2']=blocks.area; blocks['area_ha']=blocks.area/10000
     blocks['target_m2']=target_m2; blocks['deviation_pct']=(blocks.area/target_m2-1)*100
     tol=float(tolerance_pct)/100
     blocks['status']=np.select([blocks.area<target_m2*(1-tol),blocks.area>target_m2*(1+tol)],['below_preferred','above_preferred'],default='within_preferred')
-    blocks['block_id']=[f'{w}-B{i:03d}' for i,w in enumerate(blocks.ward,1)]
     # QA metadata retained in the dataframe attrs for the app panel.
     blocks.attrs['learned_reference_count']=pattern['count']
     blocks.attrs['learned_median_area_ha']=pattern['median_area']/10000
@@ -456,6 +462,7 @@ with st.sidebar:
     block_color=st.color_picker('Block outline colour','#0066CC'); block_weight=st.slider('Block line weight',0.5,8.0,2.5,0.5)
     block_fill=st.checkbox('Fill planning blocks',value=False); block_fill_opacity=st.slider('Block fill opacity',0.0,0.8,0.15,0.05)
     road_weight=st.slider('Road line weight',0.5,5.0,1.5,0.5)
+    show_buildings=st.checkbox('Show coded building footprints',value=False,help='Turn on only when inspecting building-level coding. Full building inventory remains available for download.')
     generate_btn=st.button('Generate blocks',type='primary',use_container_width=True)
     st.info('Target area is a preference, not a maximum. Generated/context blocks are capped by the robust upper scale of the observed road-defined block pattern, excluding anomalous giant polygonized areas. The tolerance affects reporting only. Minimum area suppresses tiny residual blocks.')
 
@@ -487,7 +494,8 @@ with left:
         st.warning('Google basemap selected, but the required API key and matching 2D tile session token were not supplied. Showing OpenStreetMap instead. Google tiles are visual only and never feed the block generator.')
     folium.GeoJson(map_wards.to_json(),name='Wards',style_function=lambda x:{'fillOpacity':0,'color':ward_color,'weight':ward_weight,'dashArray':'8,5'},tooltip=folium.GeoJsonTooltip(fields=['ward'],aliases=['Ward'],sticky=False)).add_to(m)
     folium.GeoJson(map_blocks.to_json(),name='Planning Blocks',style_function=lambda f:{'fillOpacity':block_fill_opacity if block_fill else 0,'fillColor':block_color,'color':block_color,'weight':block_weight,'opacity':0.95},highlight_function=lambda f:{'weight':max(block_weight+1.5,block_weight),'fillOpacity':block_fill_opacity if block_fill else 0},tooltip=folium.GeoJsonTooltip(fields=['block_id','ward','area_ha','status','building_count'],aliases=['Block','Ward','Area (ha)','Status','Buildings'],sticky=False)).add_to(m)
-    folium.GeoJson(map_buildings.to_json(),name='Buildings — coded & labelled',style_function=lambda f:{'fillOpacity':0.35,'color':'#8B0000','weight':1.0},highlight_function=lambda f:{'weight':2.0,'fillOpacity':0.55},tooltip=folium.GeoJsonTooltip(fields=['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','Boundary_Flag'],aliases=['Building Code','Ward','Block','Building Area (m²)','Source','Boundary flag'],localize=True,sticky=False)).add_to(m)
+    if show_buildings:
+        folium.GeoJson(map_buildings.to_json(),name='Buildings — coded & labelled',style_function=lambda f:{'fillOpacity':0.35,'color':'#8B0000','weight':1.0},highlight_function=lambda f:{'weight':2.0,'fillOpacity':0.55},tooltip=folium.GeoJsonTooltip(fields=['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','Boundary_Flag'],aliases=['Building Code','Ward','Block','Building Area (m²)','Source','Boundary flag'],localize=True,sticky=False)).add_to(m)
     folium.GeoJson(map_roads.to_json(),name='Road network',style_function=lambda x:{'weight':road_weight,'opacity':0.65}).add_to(m)
     m.fit_bounds([[bounds[1],bounds[0]],[bounds[3],bounds[2]]]); folium.LayerControl(collapsed=False).add_to(m); st_folium(m,height=650,width=None)
 with right:
