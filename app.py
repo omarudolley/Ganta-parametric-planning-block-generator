@@ -11,7 +11,6 @@ st.set_page_config(page_title='Ganta Planning Block Generator', layout='wide')
 DATA='Ganta_BaseData.gpkg'; WARDS='Ganta_Wards.shp'
 ROAD_CLASSES=['primary','trunk','tertiary','unclassified','residential','service','track','path','footway']
 
-@st.cache_data
 @st.cache_data(show_spinner=False)
 def load_data():
     roads=gpd.read_file(DATA, layer='ganta_roads')
@@ -96,83 +95,63 @@ def enforce_partition(cells, ward):
     return [clean(c) for c in accepted if not c.is_empty and c.area>1]
 
 def _line_building_penalty(line, buildings, poly=None):
-    """Measure only the portion of a proposed cut that lies inside *poly*.
-    Building footprints are treated as protected geometry: crossing one is a
-    very strong penalty, while a cut in a genuine gap is preferred."""
+    """Fast building-crossing score using the building spatial index.
+    Only buildings relevant to the current polygon are considered."""
     if buildings is None or len(buildings) == 0:
         return 0.0, 0
-    test_line = line
-    if poly is not None:
-        try:
-            test_line = line.intersection(poly)
-        except Exception:
+    try:
+        query_line = line
+        if poly is not None:
+            query_line = line.intersection(poly)
+            if query_line.is_empty:
+                return 0.0, 0
+        hits = buildings.sindex.query(query_line, predicate='intersects')
+        if len(hits) == 0:
             return 0.0, 0
-    if test_line.is_empty:
-        return 0.0, 0
-    try:
-        hits = buildings.sindex.query(test_line, predicate='intersects')
+        geoms = buildings.geometry.iloc[np.asarray(hits, dtype=int)].to_numpy()
+        inter = __import__('shapely').intersection(geoms, query_line)
+        lengths = __import__('shapely').length(inter)
+        mask = np.asarray(lengths) > 0.01
+        return float(np.asarray(lengths)[mask].sum()), int(mask.sum())
     except Exception:
-        hits = []
-    if len(hits) == 0:
         return 0.0, 0
-    total = 0.0
-    count = 0
-    for idx in hits:
-        try:
-            inter = test_line.intersection(buildings.geometry.iloc[int(idx)])
-            if not inter.is_empty and inter.length > 0.01:
-                total += float(inter.length)
-                count += 1
-        except Exception:
-            pass
-    return total, count
 
-
-def _building_gap_positions(poly, buildings, axis, max_candidates=8):
-    """Return cut positions located in actual gaps between local building
-    bounding boxes. This is especially useful where roads do not define a
-    usable layout. Bounding boxes are only used to find safe gaps; buildings
-    themselves never become block boundaries."""
+def _building_gap_positions(poly, buildings, axis, max_candidates=6):
+    """Return promising cut positions through the largest building-free gaps.
+    Building boxes are used only to locate gaps; buildings never become block edges."""
     if buildings is None or len(buildings) == 0:
         return []
-    minx, miny, maxx, maxy = poly.bounds
     try:
-        # Fast spatial-index lookup: only inspect buildings near this polygon.
-        local_idx = buildings.sindex.query(poly, predicate='intersects')
+        hits = buildings.sindex.query(poly, predicate='intersects')
+        if len(hits) == 0:
+            return []
+        minx,miny,maxx,maxy=poly.bounds
+        intervals=[]
+        for idx in np.asarray(hits, dtype=int):
+            g=buildings.geometry.iloc[int(idx)]
+            bx0,by0,bx1,by1=g.bounds
+            a,b=(bx0,bx1) if axis=='x' else (by0,by1)
+            lo,hi=(minx,maxx) if axis=='x' else (miny,maxy)
+            a=max(a,lo); b=min(b,hi)
+            if b>a: intervals.append((a,b))
+        if not intervals: return []
+        intervals.sort(); merged=[]
+        for a,b in intervals:
+            if not merged or a>merged[-1][1]: merged.append([a,b])
+            else: merged[-1][1]=max(merged[-1][1],b)
+        lo,hi=(minx,maxx) if axis=='x' else (miny,maxy)
+        gaps=[]; cur=lo
+        for a,b in merged:
+            if a-cur>0: gaps.append((a-cur,cur,a))
+            cur=max(cur,b)
+        if hi-cur>0: gaps.append((hi-cur,cur,hi))
+        gaps.sort(reverse=True)
+        return [(a+b)/2 for _,a,b in gaps[:max_candidates] if b-a>1.0]
     except Exception:
         return []
-    intervals = []
-    lo, hi = (minx, maxx) if axis == 'x' else (miny, maxy)
-    for idx in local_idx:
-        try:
-            b = buildings.geometry.iloc[int(idx)]
-            bx0, by0, bx1, by1 = b.bounds
-            a0, a1 = (bx0, bx1) if axis == 'x' else (by0, by1)
-            a0=max(a0,lo); a1=min(a1,hi)
-            if a1 > a0:
-                intervals.append((a0,a1))
-        except Exception:
-            continue
-    if not intervals:
-        return []
-    intervals.sort()
-    gaps=[]
-    cur=lo
-    for a0,a1 in intervals:
-        if a0-cur > max((hi-lo)*0.01, 2.0):
-            gaps.append((cur,a0,a0-cur))
-        cur=max(cur,a1)
-    if hi-cur > max((hi-lo)*0.01, 2.0):
-        gaps.append((cur,hi,hi-cur))
-    # Largest gaps are the most robust places to pass a block cut.
-    gaps.sort(key=lambda x:x[2], reverse=True)
-    return [(a+b)/2.0 for a,b,_ in gaps[:max_candidates]]
-
 
 def split_best(poly, target, buildings=None):
-    """Split a weak/context polygon while strongly preferring cuts through
-    genuine gaps between existing buildings. In road-poor areas, building
-    footprints act as protected constraints rather than block boundaries."""
+    """Split a polygon while strongly preferring cuts through building-free gaps."""
     poly=clean(poly)
     if poly.is_empty or poly.area<=target*1.02:return [poly]
     if poly.geom_type=='MultiPolygon':
@@ -183,21 +162,14 @@ def split_best(poly, target, buildings=None):
     axes=['x','y'] if w>=h else ['y','x']
     candidates=[]
     for axis in axes:
-        lo,hi=(minx,maxx) if axis=='x' else (miny,maxy)
-        span=hi-lo
+        lo,hi=(minx,maxx) if axis=='x' else (miny,maxy); span=hi-lo
         if span<=0: continue
-        # Normal area-balanced candidates.
-        positions=[lo+span*f for f in (0.30,0.40,0.50,0.60,0.70)]
-        # Add positions in real building-free gaps. These candidates are given
-        # priority over a mathematically perfect cut through a building.
-        positions += _building_gap_positions(poly,buildings,axis,max_candidates=10)
-        # De-duplicate close positions.
-        uniq=[]
-        for v in sorted(positions):
-            if lo+span*0.03 < v < hi-span*0.03 and all(abs(v-u)>span*0.01 for u in uniq):
-                uniq.append(v)
-        for v in uniq:
-            pad=max(w,h)*2+10
+        positions=[lo+span*f for f in (0.35,0.45,0.50,0.55,0.65)]
+        positions += _building_gap_positions(poly,buildings,axis,max_candidates=6)
+        # Deduplicate nearby cut positions to keep recursion cheap.
+        positions=sorted(set(round(v,2) for v in positions))
+        for v in positions:
+            pad=max(w,h)*0.25+5
             ln=LineString([(v,miny-pad),(v,maxy+pad)]) if axis=='x' else LineString([(minx-pad,v),(maxx+pad,v)])
             try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
             except Exception: continue
@@ -207,15 +179,13 @@ def split_best(poly, target, buildings=None):
             balance=abs(np.median(areas)-target)/max(target,1)
             oversize=max(areas.max()/max(target,1)-1,0)
             cut_len,cut_count=_line_building_penalty(ln,buildings,poly)
-            # Zero-crossing cuts win decisively. A crossing cut is allowed only
-            # when no usable building-free alternative exists.
+            # Crossing a building is a last resort. Prefer a larger area imbalance
+            # over a cut through an existing footprint whenever possible.
             building_penalty=1000.0*cut_count + 200.0*cut_len/max(np.sqrt(poly.area),1.0)
             score=balance + 1.5*small + 0.10*oversize + building_penalty
             candidates.append((score,cut_count,cut_len,pieces))
     if not candidates:return [poly]
     zero=[c for c in candidates if c[1]==0 and c[2] <= 0.01]
-    # Prefer safe cuts, but still allow a crossing cut if the geometry cannot
-    # produce two reasonable pieces without one.
     pool=zero if zero else candidates
     return min(pool,key=lambda x:x[0])[3]
 
@@ -462,24 +432,34 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     bj=gpd.sjoin(rep_gdf,blocks[['block_id','Ward_Code','ward','geometry']],predicate='within',how='left')
     buildings_out['Block_Code']=bj['block_id'].values
     buildings_out['Ward_Code']=bj['Ward_Code'].values
-    # A building is flagged if its footprint intersects more than one block or
-    # if its boundary is actually crossed by a block edge. We never clip it.
-    b_sidx=blocks.sindex
-    boundary_flags=[]
-    multi_flags=[]
-    for geom in buildings_out.geometry:
-        try: hits=list(b_sidx.query(geom,predicate='intersects'))
-        except Exception: hits=[]
-        multi_flags.append(len(set(map(int,hits)))>1)
-        crossed=False
-        try:
-            for hi in hits:
-                inter=geom.intersection(blocks.geometry.iloc[int(hi)].boundary)
-                if not inter.is_empty and inter.length>0.01:
-                    crossed=True; break
-        except Exception: pass
-        boundary_flags.append(crossed)
-    buildings_out['Boundary_Flag']=[bool(a or b) for a,b in zip(boundary_flags,multi_flags)]
+    # Vectorized boundary-crossing check. This replaces a Python loop over all
+    # 24k buildings and is substantially faster on Streamlit Cloud.
+    hit = gpd.sjoin(
+        buildings_out[['geometry']],
+        blocks[['block_id','geometry']],
+        predicate='intersects', how='left'
+    )
+    hit_counts = hit.groupby(hit.index).size()
+    multi_flags = hit_counts.reindex(buildings_out.index, fill_value=0).to_numpy() > 1
+    # A footprint crossing a block edge has positive-length intersection with a
+    # block boundary. Candidate pairs are limited by the spatial join above.
+    hit = hit.reset_index().rename(columns={'index':'building_idx'})
+    if len(hit):
+        valid = hit['index_right'].notna()
+        hp = hit.loc[valid, ['building_idx','index_right']].copy()
+        if len(hp):
+            bg = buildings_out.geometry.iloc[hp['building_idx'].to_numpy()].reset_index(drop=True)
+            bb = blocks.geometry.iloc[hp['index_right'].astype(int).to_numpy()].boundary.reset_index(drop=True)
+            inter = __import__('shapely').intersection(bg.to_numpy(), bb.to_numpy())
+            lens = __import__('shapely').length(inter)
+            crossed_idx = hp.loc[np.asarray(lens)>0.01, 'building_idx'].astype(int).unique()
+        else:
+            crossed_idx=np.array([],dtype=int)
+    else:
+        crossed_idx=np.array([],dtype=int)
+    boundary_flags=np.zeros(len(buildings_out),dtype=bool)
+    boundary_flags[crossed_idx]=True
+    buildings_out['Boundary_Flag']=boundary_flags | multi_flags
     buildings_out['Building_Source']='OSM existing'
     buildings_out['AI_Confidence']=np.nan
     # Use the final block code directly. Do not cast an auxiliary order field
@@ -530,7 +510,7 @@ if 'blocks' not in st.session_state or st.session_state.get('gen_sig')!=gen_sig 
         blocks,wards,roads,buildings=generate(target_ha*10000,min_ha*10000,classes,road_source,tolerance_pct)
         st.session_state.update(blocks=blocks,wards=wards,roads=roads,buildings=buildings,gen_sig=gen_sig)
 blocks=st.session_state.blocks; wards=st.session_state.wards; roads=st.session_state.roads; buildings=st.session_state.buildings
-map_blocks=blocks.to_crs(4326); map_wards=wards.to_crs(4326); map_roads=roads.to_crs(4326); map_buildings=buildings.to_crs(4326)
+map_blocks=blocks.to_crs(4326); map_wards=wards.to_crs(4326); map_roads=roads.to_crs(4326); map_buildings=buildings.to_crs(4326) if show_buildings else None
 bounds=map_wards.total_bounds; center=[(bounds[1]+bounds[3])/2,(bounds[0]+bounds[2])/2]
 
 c1,c2,c3,c4,c5=st.columns(5); c1.metric('Planning blocks',len(blocks)); c5.metric('Coded buildings',len(buildings)) ; c2.metric('Target area',f'{target_ha:.1f} ha'); c3.metric('Within preferred range',f'{(blocks.status=="within_preferred").mean()*100:.0f}%'); c4.metric('Median block',f'{blocks.area_ha.median():.2f} ha')
