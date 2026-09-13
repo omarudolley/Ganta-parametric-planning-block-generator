@@ -521,7 +521,8 @@ with st.sidebar:
     block_color=st.color_picker('Block outline colour','#0066CC'); block_weight=st.slider('Block line weight',0.5,8.0,2.5,0.5)
     block_fill=st.checkbox('Fill planning blocks',value=False); block_fill_opacity=st.slider('Block fill opacity',0.0,0.8,0.15,0.05)
     road_weight=st.slider('Road line weight',0.5,5.0,1.5,0.5)
-    show_buildings=st.checkbox('Show coded building footprints',value=False,help='Turn on only when inspecting building-level coding. Full building inventory remains available for download.')
+    show_buildings=st.checkbox('Show coded building footprints',value=False,help='Turn on when inspecting building-level coding. Full building inventory remains available for download.')
+    show_building_labels=st.checkbox('Show building annotations',value=True,disabled=not show_buildings,help='Displays the Building Code directly on each building footprint. Hover still shows the full building information.')
     generate_btn=st.button('Generate blocks',type='primary',use_container_width=True)
     st.info('Target area is a preference, not a maximum. Generated/context blocks are capped by the robust upper scale of the observed road-defined block pattern, excluding anomalous giant polygonized areas. The tolerance affects reporting only. Minimum area suppresses tiny residual blocks.')
 
@@ -554,7 +555,14 @@ with left:
     folium.GeoJson(map_wards.to_json(),name='Wards',style_function=lambda x:{'fillOpacity':0,'color':ward_color,'weight':ward_weight,'dashArray':'8,5'},tooltip=folium.GeoJsonTooltip(fields=['ward'],aliases=['Ward'],sticky=False)).add_to(m)
     folium.GeoJson(map_blocks.to_json(),name='Planning Blocks',style_function=lambda f:{'fillOpacity':block_fill_opacity if block_fill else 0,'fillColor':block_color,'color':block_color,'weight':block_weight,'opacity':0.95},highlight_function=lambda f:{'weight':max(block_weight+1.5,block_weight),'fillOpacity':block_fill_opacity if block_fill else 0},tooltip=folium.GeoJsonTooltip(fields=['block_id','ward','area_ha','status','building_count'],aliases=['Block','Ward','Area (ha)','Status','Buildings'],sticky=False)).add_to(m)
     if show_buildings:
-        folium.GeoJson(map_buildings.to_json(),name='Buildings — coded & labelled',style_function=lambda f:{'fillOpacity':0.35,'color':'#8B0000','weight':1.0},highlight_function=lambda f:{'weight':2.0,'fillOpacity':0.55},tooltip=folium.GeoJsonTooltip(fields=['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','Boundary_Flag'],aliases=['Building Code','Ward','Block','Building Area (m²)','Source','Boundary flag'],localize=True,sticky=False)).add_to(m)
+        full_fields=['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','Boundary_Flag']
+        full_aliases=['Building Code','Ward','Block','Building Area (m²)','Source','Boundary flag']
+        if show_building_labels:
+            btip=folium.GeoJsonTooltip(fields=['Building_Code'],aliases=[''],labels=False,sticky=False,permanent=True,direction='center',opacity=0.9,class_name='building-annotation')
+        else:
+            btip=folium.GeoJsonTooltip(fields=full_fields,aliases=full_aliases,localize=True,sticky=False)
+        bpopup=folium.GeoJsonPopup(fields=full_fields,aliases=full_aliases,localize=True,labels=True,sticky=False)
+        folium.GeoJson(map_buildings.to_json(),name='Buildings — coded & annotated',style_function=lambda f:{'fillOpacity':0.35,'color':'#8B0000','weight':1.0},highlight_function=lambda f:{'weight':2.0,'fillOpacity':0.55},tooltip=btip,popup=bpopup).add_to(m)
     folium.GeoJson(map_roads.to_json(),name='Road network',style_function=lambda x:{'weight':road_weight,'opacity':0.65}).add_to(m)
     m.fit_bounds([[bounds[1],bounds[0]],[bounds[3],bounds[2]]]); folium.LayerControl(collapsed=False).add_to(m); st_folium(m,height=650,width=None)
 with right:
