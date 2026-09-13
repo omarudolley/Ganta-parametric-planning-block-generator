@@ -445,8 +445,15 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
     reps=buildings_out.geometry.representative_point()
     rep_gdf=gpd.GeoDataFrame({'geometry':reps},crs=buildings_out.crs)
     bj=gpd.sjoin(rep_gdf,blocks[['block_id','Ward_Code','ward','geometry']],predicate='within',how='left')
-    buildings_out['Block_Code']=bj['block_id'].values
-    buildings_out['Ward_Code']=bj['Ward_Code'].values
+    # A representative point can match more than one block if an upstream
+    # topology edge is duplicated/touching. Resolve that here so assignment
+    # always has exactly one row per source building. Never use raw .values,
+    # because sjoin output can legitimately contain duplicate source indices.
+    if len(bj):
+        bj = bj[~bj.index.duplicated(keep='first')]
+    bj = bj.reindex(buildings_out.index)
+    buildings_out['Block_Code']=bj['block_id'].to_numpy()
+    buildings_out['Ward_Code']=bj['Ward_Code'].to_numpy()
     # Vectorized boundary-crossing check. This replaces a Python loop over all
     # 24k buildings and is substantially faster on Streamlit Cloud.
     hit = gpd.sjoin(
