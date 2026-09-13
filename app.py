@@ -164,8 +164,10 @@ def split_best(poly, target, buildings=None):
     for axis in axes:
         lo,hi=(minx,maxx) if axis=='x' else (miny,maxy); span=hi-lo
         if span<=0: continue
-        positions=[lo+span*f for f in (0.35,0.45,0.50,0.55,0.65)]
-        positions += _building_gap_positions(poly,buildings,axis,max_candidates=6)
+        positions=[lo+span*f for f in (0.40,0.50,0.60)]
+        # Only a few of the largest building-free gaps are needed; this keeps
+        # recursive splitting responsive on large road-poor polygons.
+        positions += _building_gap_positions(poly,buildings,axis,max_candidates=4)
         # Deduplicate nearby cut positions to keep recursion cheap.
         positions=sorted(set(round(v,2) for v in positions))
         for v in positions:
@@ -191,7 +193,7 @@ def split_best(poly, target, buildings=None):
 
 def target_subdivide(poly,target,min_area,buildings=None):
     out=[]; stack=[poly]; guard=0
-    while stack and guard<10000:
+    while stack and guard<2500:
         guard+=1; p=clean(stack.pop())
         if p.is_empty or p.area<=1:continue
         if p.area<=target*1.02:
@@ -319,23 +321,38 @@ def learned_target(poly, refs_gdf, pattern, user_target):
     return float(np.clip(desired,lo,hi))
 
 def enforce_learned_cap(cells, cap, buildings=None):
-    """Ensure generated/context blocks never exceed the largest road-defined block."""
+    """Fast bounded cap enforcement for context-generated polygons.
+    Existing coherent road cells should normally arrive here already intact;
+    oversized context polygons are split with a bounded number of passes.
+    """
     if cap is None or cap <= 1:
         return cells
-    out=[]; stack=list(cells); safe_target=max(cap/1.03,1.0)
-    while stack:
-        p=clean(stack.pop())
+    out=[]
+    stack=[clean(c) for c in cells if c is not None and not c.is_empty and c.area>1]
+    passes=0
+    while stack and passes < 4000:
+        p=stack.pop(); passes += 1
         if p.is_empty or p.area<=1: continue
         if p.area <= cap*1.000001:
             out.append(p); continue
-        pieces=split_best(p,safe_target,buildings)
-        if len(pieces)>=2 and any(x.area < p.area*0.999 for x in pieces):
-            stack.extend(pieces)
+        pieces=split_best(p,max(cap*0.92,1.0),buildings)
+        valid=[x for x in pieces if x is not None and not x.is_empty and x.area>1]
+        if len(valid)>=2 and sum(x.area for x in valid) >= p.area*0.98:
+            stack.extend(valid)
         else:
-            # Last-resort geometric split using a more aggressive target.
-            pieces=split_best(p,max(cap/2,1.0),buildings)
-            if len(pieces)>=2: stack.extend(pieces)
+            # Deterministic geometric fallback. This avoids getting trapped in
+            # repeated building-gap searches when a difficult polygon cannot
+            # be split by the preferred candidates.
+            minx,miny,maxx,maxy=p.bounds; w=maxx-minx; h=maxy-miny
+            axis='x' if w>=h else 'y'; v=(minx+maxx)/2 if axis=='x' else (miny+maxy)/2
+            pad=max(w,h)+10
+            ln=LineString([(v,miny-pad),(v,maxy+pad)]) if axis=='x' else LineString([(minx-pad,v),(maxx+pad,v)])
+            try: valid=[clean(x) for x in split(p,ln).geoms if x.area>1]
+            except Exception: valid=[]
+            if len(valid)>=2: stack.extend(valid)
             else: out.append(p)
+    if stack:
+        out.extend(stack)
     return out
 
 @st.cache_data(show_spinner=False)
@@ -383,10 +400,8 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
                 else:
                     pieces.append(cell)
 
-        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         pieces=merge_tiny(pieces,min_m2)
         pieces=repair_partition(pieces,wg)
-        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         # Only weak/context-generated polygons are subdivided here. A coherent
         # road-defined unit is never broken merely because it exceeds the target.
         refined=[]
@@ -400,9 +415,9 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
                 else: refined.append(p)
             else: refined.append(p)
         pieces=enforce_partition(merge_tiny(refined,min_m2),wg)
+        # Apply the evidence-based cap once, after all contextual refinement.
         pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         pieces=enforce_partition(pieces,wg)
-        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         # Re-partition after every cap split so the final output can never
         # contain overlaps, nested polygons, or sliver gaps.
         pieces=enforce_partition(pieces,wg)
