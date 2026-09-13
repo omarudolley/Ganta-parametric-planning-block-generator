@@ -95,42 +95,81 @@ def enforce_partition(cells, ward):
             accepted[i]=clean(accepted[i].union(g))
     return [clean(c) for c in accepted if not c.is_empty and c.area>1]
 
-def split_best(poly,target):
-    # Fast deterministic split: cut across the longer bounding-box axis near
-    # the midpoint. A small set of alternatives handles irregular polygons
-    # without the combinatorial cost of evaluating many cuts recursively.
+def _line_building_penalty(line, buildings):
+    """Measure how much a proposed block cut passes through buildings.
+    The score is deliberately strong: in road-poor areas we prefer a slightly
+    less area-balanced cut if it avoids existing building footprints."""
+    if buildings is None or len(buildings) == 0:
+        return 0.0, 0
+    try:
+        hits = buildings.sindex.query(line, predicate='intersects')
+    except Exception:
+        hits = []
+    if len(hits) == 0:
+        return 0.0, 0
+    total = 0.0
+    count = 0
+    for idx in hits:
+        try:
+            inter = line.intersection(buildings.geometry.iloc[int(idx)])
+            if not inter.is_empty:
+                total += float(inter.length)
+                count += 1
+        except Exception:
+            pass
+    return total, count
+
+def split_best(poly, target, buildings=None):
+    """Fast deterministic split that actively avoids cutting through buildings.
+    Candidate cuts are tested against the building spatial index. A no-building
+    cut wins whenever its area balance is reasonably acceptable."""
     poly=clean(poly)
     if poly.is_empty or poly.area<=target*1.02:return [poly]
     if poly.geom_type=='MultiPolygon':
         out=[]
-        for p in poly.geoms: out.extend(split_best(p,target))
+        for p in poly.geoms: out.extend(split_best(p,target,buildings))
         return out
     minx,miny,maxx,maxy=poly.bounds; w=maxx-minx; h=maxy-miny
-    use_x=w>=h
-    lo,hi=(minx,maxx) if use_x else (miny,maxy); span=hi-lo
-    if span<=0:return [poly]
+    # Test both axes where possible; this gives the algorithm a chance to move
+    # around building clusters instead of always slicing on one axis.
+    axes=[]
+    if w>=h: axes=['x','y']
+    else: axes=['y','x']
     candidates=[]
-    for frac in (0.45,0.50,0.55):
-        v=lo+span*frac; pad=max(w,h)*2+10
-        ln=LineString([(v,miny-pad),(v,maxy+pad)]) if use_x else LineString([(minx-pad,v),(maxx+pad,v)])
-        try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
-        except Exception: continue
-        if len(pieces)<2: continue
-        areas=np.array([p.area for p in pieces])
-        # Prefer balanced pieces and penalize fragments below the minimum.
-        small=(areas<0.25*target).sum()
-        score=abs(np.median(areas)-target)/max(target,1)+1.0*small+0.10*abs(areas.max()-target)/max(target,1)
-        candidates.append((score,pieces))
-    return min(candidates,key=lambda x:x[0])[1] if candidates else [poly]
+    for axis in axes:
+        lo,hi=(minx,maxx) if axis=='x' else (miny,maxy)
+        span=hi-lo
+        if span<=0: continue
+        for frac in (0.35,0.45,0.50,0.55,0.65):
+            v=lo+span*frac; pad=max(w,h)*2+10
+            ln=LineString([(v,miny-pad),(v,maxy+pad)]) if axis=='x' else LineString([(minx-pad,v),(maxx+pad,v)])
+            try: pieces=[clean(x) for x in split(poly,ln).geoms if x.area>1]
+            except Exception: continue
+            if len(pieces)<2: continue
+            areas=np.array([p.area for p in pieces])
+            small=(areas<0.25*target).sum()
+            balance=abs(np.median(areas)-target)/max(target,1)
+            oversize=max(areas.max()/max(target,1)-1,0)
+            cut_len,cut_count=_line_building_penalty(ln,buildings)
+            # A cut crossing even one building is heavily penalized. Zero-crossing
+            # candidates therefore dominate unless they create pathological pieces.
+            building_penalty=25.0*cut_count + 80.0*cut_len/max(np.sqrt(poly.area),1.0)
+            score=balance + 1.5*small + 0.10*oversize + building_penalty
+            candidates.append((score,cut_count,cut_len,pieces))
+    if not candidates:return [poly]
+    # Prefer cuts that do not cross buildings; among those use geometry score.
+    zero=[c for c in candidates if c[1]==0 and c[2] <= 0.01]
+    pool=zero if zero else candidates
+    return min(pool,key=lambda x:x[0])[3]
 
-def target_subdivide(poly,target,min_area):
+def target_subdivide(poly,target,min_area,buildings=None):
     out=[]; stack=[poly]; guard=0
     while stack and guard<10000:
         guard+=1; p=clean(stack.pop())
         if p.is_empty or p.area<=1:continue
         if p.area<=target*1.02:
             out.append(p);continue
-        pieces=split_best(p,target)
+        pieces=split_best(p,target,buildings)
         if len(pieces)<2:out.append(p)
         else:stack.extend(pieces)
     return out
@@ -252,7 +291,7 @@ def learned_target(poly, refs_gdf, pattern, user_target):
         desired=min(desired, hi)
     return float(np.clip(desired,lo,hi))
 
-def enforce_learned_cap(cells, cap):
+def enforce_learned_cap(cells, cap, buildings=None):
     """Ensure generated/context blocks never exceed the largest road-defined block."""
     if cap is None or cap <= 1:
         return cells
@@ -262,12 +301,12 @@ def enforce_learned_cap(cells, cap):
         if p.is_empty or p.area<=1: continue
         if p.area <= cap*1.000001:
             out.append(p); continue
-        pieces=split_best(p,safe_target)
+        pieces=split_best(p,safe_target,buildings)
         if len(pieces)>=2 and any(x.area < p.area*0.999 for x in pieces):
             stack.extend(pieces)
         else:
             # Last-resort geometric split using a more aggressive target.
-            pieces=split_best(p,max(cap/2,1.0))
+            pieces=split_best(p,max(cap/2,1.0),buildings)
             if len(pieces)>=2: stack.extend(pieces)
             else: out.append(p)
     return out
@@ -312,15 +351,15 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
             else:
                 desired=learned_target(cell,ref_gdf,pattern,target_m2)
                 if cell.area>desired*1.02:
-                    pieces.extend(target_subdivide(cell,desired,min_m2))
+                    pieces.extend(target_subdivide(cell,desired,min_m2,buildings))
                     generated_by_context += 1
                 else:
                     pieces.append(cell)
 
-        pieces=enforce_learned_cap(pieces,max_reference_area)
+        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         pieces=merge_tiny(pieces,min_m2)
         pieces=repair_partition(pieces,wg)
-        pieces=enforce_learned_cap(pieces,max_reference_area)
+        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         # Only weak/context-generated polygons are subdivided here. A coherent
         # road-defined unit is never broken merely because it exceeds the target.
         refined=[]
@@ -330,92 +369,75 @@ def generate(target_m2,min_m2,classes,road_source,tolerance_pct):
             if p.area>target_m2*1.02 and not natural_unit:
                 desired=learned_target(p,ref_gdf,pattern,target_m2)
                 if p.area>desired*1.02:
-                    refined.extend(target_subdivide(p,desired,min_m2)); generated_by_context += 1
+                    refined.extend(target_subdivide(p,desired,min_m2,buildings)); generated_by_context += 1
                 else: refined.append(p)
             else: refined.append(p)
         pieces=enforce_partition(merge_tiny(refined,min_m2),wg)
-        pieces=enforce_learned_cap(pieces,max_reference_area)
+        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         pieces=enforce_partition(pieces,wg)
-        pieces=enforce_learned_cap(pieces,max_reference_area)
+        pieces=enforce_learned_cap(pieces,max_reference_area,buildings)
         # Re-partition after every cap split so the final output can never
         # contain overlaps, nested polygons, or sliver gaps.
         pieces=enforce_partition(pieces,wg)
         all_blocks.extend({'ward':ward_name,'geometry':p} for p in pieces)
 
     blocks=gpd.GeoDataFrame(all_blocks,crs=wards.crs)
-    # Final block attributes first, then assign every building to exactly one
-    # planning block. Buildings are NOT used to create block boundaries.
+    # One building spatial join only, after final block geometry is known.
+    bpts=buildings.copy(); bpts['geometry']=bpts.geometry.centroid
+    joined=gpd.sjoin(bpts,blocks[['geometry']],predicate='within',how='left')
+    counts=joined.groupby('index_right').size()
+    blocks['building_count']=[int(counts.get(i,0)) for i in blocks.index]
+
+    # Full building inventory: assign every building to a final block, retain
+    # the real footprint and area, and flag footprints that straddle a block.
+    buildings_out=buildings.copy()
+    buildings_out=buildings_out.reset_index(drop=True)
+    buildings_out['Building_Area_m2']=buildings_out.geometry.area
+    # Representative point avoids failures caused by a footprint touching a
+    # block boundary; boundary crossings are separately flagged below.
+    reps=buildings_out.geometry.representative_point()
+    rep_gdf=gpd.GeoDataFrame({'geometry':reps},crs=buildings_out.crs)
+    bj=gpd.sjoin(rep_gdf,blocks[['block_id','ward','geometry']],predicate='within',how='left')
+    buildings_out['Block_Code']=bj['block_id'].values
+    buildings_out['Ward_Code']=bj['ward'].values
+    # A building is flagged if its footprint intersects more than one block or
+    # if its boundary is actually crossed by a block edge. We never clip it.
+    b_sidx=blocks.sindex
+    boundary_flags=[]
+    multi_flags=[]
+    for geom in buildings_out.geometry:
+        try: hits=list(b_sidx.query(geom,predicate='intersects'))
+        except Exception: hits=[]
+        multi_flags.append(len(set(map(int,hits)))>1)
+        crossed=False
+        try:
+            for hi in hits:
+                inter=geom.intersection(blocks.geometry.iloc[int(hi)].boundary)
+                if not inter.is_empty and inter.length>0.01:
+                    crossed=True; break
+        except Exception: pass
+        boundary_flags.append(crossed)
+    buildings_out['Boundary_Flag']=[bool(a or b) for a,b in zip(boundary_flags,multi_flags)]
+    buildings_out['Building_Source']='OSM existing'
+    buildings_out['AI_Confidence']=np.nan
+    buildings_out['Building_Code']=[
+        f"{w}-B{int(str(b).split('-B')[-1]):03d}-BLD{i:04d}" if pd.notna(w) and pd.notna(b) else f"UNASSIGNED-BLD{i:04d}"
+        for i,(w,b) in enumerate(zip(buildings_out['Ward_Code'],buildings_out['Block_Code']),1)
+    ]
     blocks['area_m2']=blocks.area; blocks['area_ha']=blocks.area/10000
     blocks['target_m2']=target_m2; blocks['deviation_pct']=(blocks.area/target_m2-1)*100
     tol=float(tolerance_pct)/100
     blocks['status']=np.select([blocks.area<target_m2*(1-tol),blocks.area>target_m2*(1+tol)],['below_preferred','above_preferred'],default='within_preferred')
-    # Stable block codes restart within each ward and are prefixed by ward code.
-    blocks['Ward_Code']=''
-    ward_order=sorted(blocks['ward'].astype(str).unique(), key=lambda x: int(''.join(ch for ch in x if ch.isdigit()) or 999))
-    ward_codes={w:f'W{i:02d}' for i,w in enumerate(ward_order,1)}
-    blocks['Ward_Code']=blocks['ward'].astype(str).map(ward_codes)
-    blocks['block_id']=''
-    for w in ward_order:
-        idx=blocks.index[blocks['ward'].astype(str)==w]
-        wc=ward_codes[w]
-        blocks.loc[idx,'block_id']=[f'{wc}-B{i:03d}' for i in range(1,len(idx)+1)]
-
-    # Assign buildings by centroid to the final block partition. If a centroid
-    # lands in a numerical edge case, fall back to the nearest block. Preserve
-    # the original building polygon; do not clip it to the block.
-    b=buildings.copy().reset_index(drop=True)
-    b['Building_Area_m2']=b.geometry.area.astype(float)
-    b['_centroid']=b.geometry.centroid
-    cent=gpd.GeoDataFrame(b.drop(columns='geometry'),geometry=b['_centroid'],crs=buildings.crs)
-    j=gpd.sjoin(cent,blocks[['block_id','Ward_Code','ward','geometry']],predicate='within',how='left')
-    j=j.rename(columns={'ward':'Block_Ward','block_id':'Block_Code','Ward_Code':'Block_Ward_Code'})
-    # A centroid exactly on a shared boundary can match more than one polygon.
-    # Collapse to one deterministic assignment so the inventory stays 1:1 with
-    # the source building layer.
-    if j.index.duplicated().any():
-        j['_has_block']=j['Block_Code'].notna()
-        j=j.sort_values(['_has_block','Block_Code'],ascending=[False,True],na_position='last').groupby(level=0,sort=False).first()
-        j=j.drop(columns=['_has_block'],errors='ignore')
-    if 'Block_Code' not in j.columns:
-        j['Block_Code']=None
-    missing=j['Block_Code'].isna()
-    if missing.any():
-        bg=blocks[['block_id','Ward_Code','ward','geometry']]
-        for bi in j.index[missing]:
-            pt=j.loc[bi,'geometry']
-            try:
-                near=list(bg.sindex.nearest(pt,return_all=False))
-                if near:
-                    k=int(near[0]); j.loc[bi,'Block_Code']=bg.iloc[k]['block_id']; j.loc[bi,'Block_Ward']=bg.iloc[k]['ward']; j.loc[bi,'Block_Ward_Code']=bg.iloc[k]['Ward_Code']
-            except Exception: pass
-    # Building codes are sequential within each planning block. OSM is the
-    # source in this version; AI fields are reserved for later verification.
-    j['_ord']=j.groupby('Block_Code').cumcount()+1
-    j['Building_Code']=j.apply(lambda r: f"{r['Block_Code']}-BLD{int(r['_ord']):04d}" if pd.notna(r['Block_Code']) else f"UNASSIGNED-BLD{int(r['_ord']):04d}",axis=1)
-    j['Ward_Code']=j['Block_Ward_Code'].astype(str)
-    j['Building_Source']='OSM existing'
-    j['AI_Confidence']=np.nan
-    # Flag a building whose footprint crosses the assigned block boundary.
-    block_geom=blocks.set_index('block_id').geometry
-    j['Boundary_Flag']=[bool(pd.notna(r.Block_Code) and not buildings.loc[i].geometry.within(block_geom.get(r.Block_Code, buildings.loc[i].geometry))) for i,r in j.iterrows()]
-    # Restore original building geometry and selected useful source attributes.
-    j=j.sort_index()
-    out=buildings.copy().reset_index(drop=True)
-    for col in ['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','AI_Confidence','Boundary_Flag']:
-        out[col]=j[col].values
-    # Building counts are based on assigned buildings, not polygon clipping.
-    counts=out.groupby('Block_Code').size()
-    blocks['building_count']=[int(counts.get(i,0)) for i in blocks['block_id']]
-
+    blocks['block_id']=[f'{w}-B{i:03d}' for i,w in enumerate(blocks.ward,1)]
     # QA metadata retained in the dataframe attrs for the app panel.
     blocks.attrs['learned_reference_count']=pattern['count']
     blocks.attrs['learned_median_area_ha']=pattern['median_area']/10000
     blocks.attrs['largest_road_reference_cap_ha']=(max_reference_area/10000 if max_reference_area else None)
     blocks.attrs['context_generated_count']=generated_by_context
-    return blocks[['block_id','Ward_Code','ward','area_m2','area_ha','target_m2','deviation_pct','status','building_count','geometry']],wards,roads,out
+    return blocks[['block_id','ward','area_m2','area_ha','target_m2','deviation_pct','status','building_count','geometry']],wards,roads,buildings_out
 
 st.title('Ganta Parametric Planning Block Generator')
-st.caption('Ward boundaries are hard limits. Existing roads define natural planning blocks where they form a coherent layout. Road-poor areas learn their preferred block scale from nearby established road-defined blocks. Generated/context blocks never exceed the robust upper scale learned from coherent road-defined blocks; anomalous giant polygonized areas are not treated as planning-block references; the target remains a soft preference. Blocks form a non-overlapping partition with no nested blocks.')
+st.caption('Ward boundaries are hard limits. Existing roads define natural planning blocks where they form a coherent layout. Road-poor areas learn their preferred block scale from nearby established road-defined blocks. Generated/context blocks never exceed the robust upper scale learned from coherent road-defined blocks; anomalous giant polygonized areas are not treated as planning-block references; the target remains a soft preference. Blocks form a non-overlapping partition with no nested blocks. In road-poor areas, candidate block cuts are actively scored to avoid existing building footprints.')
 with st.sidebar:
     st.header('Block parameters')
     target_ha=st.number_input('Target block area (ha)',min_value=1.0,max_value=100.0,value=1.0,step=0.25)
@@ -443,11 +465,11 @@ if 'blocks' not in st.session_state or st.session_state.get('gen_sig')!=gen_sig 
     with st.spinner('Generating planning blocks...'):
         blocks,wards,roads,buildings=generate(target_ha*10000,min_ha*10000,classes,road_source,tolerance_pct)
         st.session_state.update(blocks=blocks,wards=wards,roads=roads,buildings=buildings,gen_sig=gen_sig)
-blocks=st.session_state.blocks; wards=st.session_state.wards; roads=st.session_state.roads
-map_blocks=blocks.to_crs(4326); map_wards=wards.to_crs(4326); map_roads=roads.to_crs(4326)
+blocks=st.session_state.blocks; wards=st.session_state.wards; roads=st.session_state.roads; buildings=st.session_state.buildings
+map_blocks=blocks.to_crs(4326); map_wards=wards.to_crs(4326); map_roads=roads.to_crs(4326); map_buildings=buildings.to_crs(4326)
 bounds=map_wards.total_bounds; center=[(bounds[1]+bounds[3])/2,(bounds[0]+bounds[2])/2]
 
-c1,c2,c3,c4,c5=st.columns(5); c1.metric('Planning blocks',len(blocks)); c2.metric('Buildings coded',len(st.session_state.buildings)); c3.metric('Target area',f'{target_ha:.1f} ha'); c4.metric('Within preferred range',f'{(blocks.status=="within_preferred").mean()*100:.0f}%'); c5.metric('Median block',f'{blocks.area_ha.median():.2f} ha')
+c1,c2,c3,c4,c5=st.columns(5); c1.metric('Planning blocks',len(blocks)); c5.metric('Coded buildings',len(buildings)) ; c2.metric('Target area',f'{target_ha:.1f} ha'); c3.metric('Within preferred range',f'{(blocks.status=="within_preferred").mean()*100:.0f}%'); c4.metric('Median block',f'{blocks.area_ha.median():.2f} ha')
 left,right=st.columns([2,1])
 with left:
     m=folium.Map(location=center,zoom_start=13,tiles=None,control_scale=True)
@@ -465,28 +487,14 @@ with left:
         st.warning('Google basemap selected, but the required API key and matching 2D tile session token were not supplied. Showing OpenStreetMap instead. Google tiles are visual only and never feed the block generator.')
     folium.GeoJson(map_wards.to_json(),name='Wards',style_function=lambda x:{'fillOpacity':0,'color':ward_color,'weight':ward_weight,'dashArray':'8,5'},tooltip=folium.GeoJsonTooltip(fields=['ward'],aliases=['Ward'],sticky=False)).add_to(m)
     folium.GeoJson(map_blocks.to_json(),name='Planning Blocks',style_function=lambda f:{'fillOpacity':block_fill_opacity if block_fill else 0,'fillColor':block_color,'color':block_color,'weight':block_weight,'opacity':0.95},highlight_function=lambda f:{'weight':max(block_weight+1.5,block_weight),'fillOpacity':block_fill_opacity if block_fill else 0},tooltip=folium.GeoJsonTooltip(fields=['block_id','ward','area_ha','status','building_count'],aliases=['Block','Ward','Area (ha)','Status','Buildings'],sticky=False)).add_to(m)
+    folium.GeoJson(map_buildings.to_json(),name='Buildings — coded & labelled',style_function=lambda f:{'fillOpacity':0.35,'color':'#8B0000','weight':1.0},highlight_function=lambda f:{'weight':2.0,'fillOpacity':0.55},tooltip=folium.GeoJsonTooltip(fields=['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','Boundary_Flag'],aliases=['Building Code','Ward','Block','Building Area (m²)','Source','Boundary flag'],localize=True,sticky=False)).add_to(m)
     folium.GeoJson(map_roads.to_json(),name='Road network',style_function=lambda x:{'weight':road_weight,'opacity':0.65}).add_to(m)
-    # Every OSM building is retained as its own polygon feature. Hover shows the
-    # assigned code, block, ward and measured footprint area. This is intentionally
-    # a GeoJson layer rather than 24k individual markers for performance.
-    map_buildings=st.session_state.buildings.to_crs(4326).copy()
-    building_fields=['Building_Code','Ward_Code','Block_Code','Building_Area_m2','Building_Source','Boundary_Flag']
-    for f in building_fields:
-        if f not in map_buildings.columns: map_buildings[f]=''
-    folium.GeoJson(
-        map_buildings[building_fields+['geometry']].to_json(),
-        name='Buildings (coded)',
-        style_function=lambda x:{'color':'#555555','weight':0.5,'fillColor':'#999999','fillOpacity':0.18},
-        highlight_function=lambda x:{'weight':1.5,'fillOpacity':0.45},
-        tooltip=folium.GeoJsonTooltip(fields=building_fields,aliases=['Building Code','Ward','Block','Area (m²)','Source','Boundary flag'],localize=True,sticky=False,labels=True),
-        show=False
-    ).add_to(m)
     m.fit_bounds([[bounds[1],bounds[0]],[bounds[3],bounds[2]]]); folium.LayerControl(collapsed=False).add_to(m); st_folium(m,height=650,width=None)
 with right:
     st.subheader('Area distribution'); st.dataframe(blocks.drop(columns='geometry').sort_values(['ward','area_m2']),use_container_width=True,height=520)
     st.download_button('Download planning blocks (GeoJSON)',blocks.to_json(),'Ganta_PlanningBlocks.geojson','application/geo+json')
-    st.download_button('Download coded buildings (GeoJSON)',st.session_state.buildings.to_json(),'Ganta_Buildings_Coded.geojson','application/geo+json')
-    st.download_button('Download building inventory (CSV)',st.session_state.buildings.drop(columns='geometry').to_csv(index=False),'Ganta_Building_Inventory.csv','text/csv')
+    st.download_button('Download coded buildings (GeoJSON)',buildings.to_json(),'Ganta_Buildings_Coded.geojson','application/geo+json')
+    st.download_button('Download building inventory (CSV)',buildings.drop(columns='geometry').to_csv(index=False),'Ganta_Building_Inventory.csv','text/csv')
     st.download_button('Download summary (CSV)',blocks.drop(columns='geometry').to_csv(index=False),'Ganta_PlanningBlocks_Summary.csv','text/csv')
 st.markdown('### Planning rule used')
-st.write('Ward boundary = hard boundary. Selected GIS roads are the primary structure source. A road-defined cell is retained at its natural size only when roads form meaningful portions of its interior boundary; ward-edge roads do not qualify. Where the layout is weak, clean target-oriented cuts are used. The target is never a maximum, and reporting tolerance does not constrain generation. Buildings are reference/development evidence only, never block boundaries. Every building is retained as an individual polygon, measured in m², assigned to a final planning block, given a unique Building_Code, and exposed through the coded-building hover layer. Buildings that cross a block boundary are flagged rather than clipped. A final topology pass guarantees a single, non-overlapping block partition per ward.')
+st.write('Ward boundary = hard boundary. Selected GIS roads are the primary structure source. A road-defined cell is retained at its natural size only when roads form meaningful portions of its interior boundary; ward-edge roads do not qualify. Where the layout is weak, clean target-oriented cuts are used. The target is never a maximum, and reporting tolerance does not constrain generation. Buildings are used as a supporting constraint in road-poor areas: generated cut lines are selected to avoid passing through building footprints where a reasonable alternative exists. Buildings never become block boundaries themselves. A final topology pass guarantees a single, non-overlapping block partition per ward.')
